@@ -3,6 +3,7 @@ package it.roma.gtfs.gtfs_monitor.service;
 import it.roma.gtfs.gtfs_monitor.model.dto.ReverseGeocodeDTO;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -10,6 +11,7 @@ import org.springframework.web.reactive.function.client.ClientResponse;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -55,8 +57,13 @@ class ReverseGeocodeServiceTest {
             .build();
     private final UpstreamGate frenoNominatim = new UpstreamGate("Nominatim", 1_000L, adesso::get);
     private final UpstreamGate frenoPhoton = new UpstreamGate("Photon", 500L, adesso::get);
+    // Una sola fermata nel file, in piazzale degli Eroi: gli altri punti dei test ne stanno lontani.
+    private final StopAddressService fermate = new StopAddressService(new ByteArrayResource("""
+            stop_id,lat,lon,street,city
+            70001,41.907500,12.446900,Piazzale degli Eroi,Roma
+            """.getBytes(StandardCharsets.UTF_8)));
     private final ReverseGeocodeService servizio =
-            new ReverseGeocodeService(webClient, frenoNominatim, frenoPhoton, adesso::get);
+            new ReverseGeocodeService(webClient, fermate, frenoNominatim, frenoPhoton, adesso::get);
 
     private void risponde(String host, String json) {
         risposte.put(host, () -> ClientResponse.create(HttpStatus.OK)
@@ -67,6 +74,15 @@ class ReverseGeocodeServiceTest {
 
     private void rifiuta(String host, HttpStatus stato) {
         risposte.put(host, () -> ClientResponse.create(stato).build());
+    }
+
+    @Test
+    @DisplayName("la via di una fermata c'e' gia': non parte nessuna richiesta")
+    void fermataSenzaChiedere() {
+        ReverseGeocodeDTO indirizzo = servizio.reverse(41.9075, 12.4469);
+
+        assertThat(indirizzo.label()).isEqualTo("Piazzale degli Eroi, Roma");
+        assertThat(chiamate).isEmpty();
     }
 
     @Test

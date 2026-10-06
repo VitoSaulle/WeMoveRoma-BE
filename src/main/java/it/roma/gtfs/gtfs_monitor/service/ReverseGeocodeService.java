@@ -10,13 +10,15 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.LongSupplier;
 
 /**
- * Da coordinate a indirizzo. Chiede a Nominatim e, se non risponde o non puo'
- * essere interrogato, a Photon: sono due servizi pubblici e gratuiti, ognuno
- * dietro il suo freno (vedi {@link UpstreamGate}).
+ * Da coordinate a indirizzo. Una fermata ha la via gia' calcolata (vedi
+ * {@link StopAddressService}); per ogni altro punto si chiede a Nominatim e,
+ * se non risponde o non puo' essere interrogato, a Photon: sono due servizi
+ * pubblici e gratuiti, ognuno dietro il suo freno (vedi {@link UpstreamGate}).
  */
 @Slf4j
 @Service
@@ -35,24 +37,33 @@ public class ReverseGeocodeService {
     private static final Duration UPSTREAM_TIMEOUT = Duration.ofSeconds(4);
 
     private final WebClient webClient;
+    private final StopAddressService stopAddresses;
     private final UpstreamGate nominatimGate;
     private final UpstreamGate photonGate;
     private final LongSupplier clock;
     private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
 
     @Autowired
-    public ReverseGeocodeService(WebClient webClient, NominatimGate nominatimGate) {
-        this(webClient, nominatimGate, new UpstreamGate("Photon", PHOTON_MIN_INTERVAL_MILLIS), System::currentTimeMillis);
+    public ReverseGeocodeService(WebClient webClient, StopAddressService stopAddresses, NominatimGate nominatimGate) {
+        this(webClient, stopAddresses, nominatimGate,
+                new UpstreamGate("Photon", PHOTON_MIN_INTERVAL_MILLIS), System::currentTimeMillis);
     }
 
-    ReverseGeocodeService(WebClient webClient, UpstreamGate nominatimGate, UpstreamGate photonGate, LongSupplier clock) {
+    ReverseGeocodeService(WebClient webClient, StopAddressService stopAddresses,
+                          UpstreamGate nominatimGate, UpstreamGate photonGate, LongSupplier clock) {
         this.webClient = webClient;
+        this.stopAddresses = stopAddresses;
         this.nominatimGate = nominatimGate;
         this.photonGate = photonGate;
         this.clock = clock;
     }
 
     public ReverseGeocodeDTO reverse(double lat, double lon) {
+        Optional<ReverseGeocodeDTO> atStop = stopAddresses.find(lat, lon);
+        if (atStop.isPresent()) {
+            return atStop.get();
+        }
+
         String key = cacheKey(lat, lon);
         CacheEntry cached = cache.get(key);
         if (cached != null && clock.getAsLong() < cached.expiresAtMillis) {
