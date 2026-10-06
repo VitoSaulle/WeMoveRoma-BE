@@ -37,6 +37,7 @@ public class GeocodeSearchService {
     );
 
     private final WebClient webClient;
+    private final NominatimGate nominatimGate;
     private final Map<String, TimedValue<List<GeocodeSearchResultDTO>>> searchCache = new ConcurrentHashMap<>();
     private final Map<String, TimedValue<List<Map<String, Object>>>> upstreamCache = new ConcurrentHashMap<>();
 
@@ -237,7 +238,6 @@ public class GeocodeSearchService {
                         }
                         return b.build();
                     })
-                    .header("User-Agent", "gtfs-monitor/1.0 (geocode-search)")
                     .retrieve()
                     .bodyToMono(Map.class)
                     .block(Duration.ofSeconds(6));
@@ -379,26 +379,42 @@ public class GeocodeSearchService {
 
     @SuppressWarnings("unchecked")
     private VariantFetch doFetch(String cacheKey, Function<UriBuilder, java.net.URI> uri) {
+        /*
+         * Una ricerca interroga Nominatim piu' volte di fila, e il freno ne
+         * lascia passare una al secondo: le altre varianti si fermano qui,
+         * come dopo un 429, e la ricerca chiude con quello che ha gia' (Photon,
+         * la variante passata, la cache). Lo stesso se Nominatim e' in pausa.
+         */
+        if (!nominatimGate.tryEnter()) {
+            return staleOrEmpty(cacheKey);
+        }
         try {
             List<Map<String, Object>> payload = webClient.get()
                     .uri(uri::apply)
-                    .header("User-Agent", "gtfs-monitor/1.0 (geocode-search)")
                     .retrieve()
                     .bodyToMono(List.class)
                     .block(Duration.ofSeconds(8));
+            nominatimGate.succeeded();
             List<Map<String, Object>> safePayload = payload == null ? List.of() : List.copyOf(payload);
             upstreamCache.put(cacheKey, new TimedValue<>(safePayload, System.currentTimeMillis()));
             return new VariantFetch(safePayload, false);
-        } catch (WebClientResponseException.TooManyRequests e) {
-            List<Map<String, Object>> stalePayload = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
-            if (stalePayload != null) {
-                log.warn("[GeocodeSearch] 429 from Nominatim, using stale upstream cache with {} result(s)",
-                        stalePayload.size());
-                return new VariantFetch(stalePayload, true);
+        } catch (Exception e) {
+            /*
+             * Un Nominatim che rifiuta o non risponde non butta via la ricerca:
+             * prima solo il 429 era trattato cosi', e un 403 o un timeout
+             * facevano perdere anche i risultati di Photon gia' raccolti.
+             */
+            if (!nominatimGate.refusedBy(e)) {
+                log.warn("[GeocodeSearch] Nominatim failed: {}", e.toString());
             }
-            log.warn("[GeocodeSearch] 429 from Nominatim, no cached fallback available");
-            return new VariantFetch(List.of(), true);
+            return staleOrEmpty(cacheKey);
         }
+    }
+
+    /** Senza Nominatim: l'ultima risposta buona per la stessa richiesta, se c'e', e niente altre varianti. */
+    private VariantFetch staleOrEmpty(String cacheKey) {
+        List<Map<String, Object>> stalePayload = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
+        return new VariantFetch(stalePayload != null ? stalePayload : List.of(), true);
     }
 
     private static String buildStreetParam(ParsedAddress address) {
