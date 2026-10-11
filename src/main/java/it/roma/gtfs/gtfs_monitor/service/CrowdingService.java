@@ -48,8 +48,8 @@ import java.util.stream.IntStream;
  * andando li'. Dove una linea arriva alla stessa fermata da due strade (un
  * ramo, una deviazione) si disegna solo la piu' battuta.
  *
- * UN GIORNO SI SOMMA UNA VOLTA SOLA, quando e' finito: l'altro ieri, perche' le
- * corse notturne di ieri finiscono oggi. La tabella e' per mese (il perche' e'
+ * UN GIORNO SI SOMMA UNA VOLTA SOLA, quando e' finito: ieri, dalle 4 del mattino
+ * (PunctualityService.ultimoGiornoFinito). La tabella e' per mese (il perche' e'
  * nella migrazione V4) e sommare non si puo' ripetere come un ricalcolo: lo
  * impedisce affollamento_giorni, scritta nella stessa transazione. Per rifare un
  * mese si cancellano le sue righe da tutte e due le tabelle: al riavvio i giorni

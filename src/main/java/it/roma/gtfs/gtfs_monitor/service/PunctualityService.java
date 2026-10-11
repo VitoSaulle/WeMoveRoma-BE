@@ -23,6 +23,7 @@ import java.time.LocalDate;
 import java.time.OffsetDateTime;
 import java.time.YearMonth;
 import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -92,6 +93,13 @@ public class PunctualityService {
     static final int LOTTO = 5_000;
     private static final long INTERVALLO_AVVISI_MILLIS = 10 * 60 * 1000L;
     private static final Pattern PARTIZIONE = Pattern.compile("passaggi_(\\d{4})_(\\d{2})");
+    /**
+     * Da quest'ora di Roma il giorno di servizio di ieri e' finito: non arrivano
+     * piu' suoi passaggi. Misurato sullo storico di produzione (8,4 milioni di
+     * passaggi, 25 settembre - 8 ottobre 2026): lo 0,87% arriva dopo la
+     * mezzanotte, tutti prima delle 2, nessuno dopo le 4.
+     */
+    static final int ORA_GIORNO_FINITO = 4;
 
     private final TripUpdatesService tripUpdatesService;
     private final VehiclePositionsService vehiclePositionsService;
@@ -117,6 +125,7 @@ public class PunctualityService {
     private long giri;
     private long ultimaManutenzioneMillis;
     private LocalDate ultimoGiornoAggregato;
+    private LocalDate ultimoGiornoAffollamento;
     private boolean trattiRecuperati;
 
     /** Passaggi di un giorno e di un'ora, gia' divisi per categoria. */
@@ -443,8 +452,14 @@ public class PunctualityService {
                     FORTE_RITARDO_DA_SEC, Date.valueOf(ieri.minusDays(1)), Date.valueOf(ieri));
             log.info("[Puntualita] aggregati {} e {}: {} righe", ieri.minusDays(1), ieri, righe);
             aggregaTratti(ieri);
-            aggregaAffollamento(ieri);
             ultimoGiornoAggregato = ieri;
+        }
+
+        // L'affollamento ha un passo suo: aspetta che il giorno sia finito davvero.
+        LocalDate finito = ultimoGiornoFinito(ZonedDateTime.now(ROMA));
+        if (ultimoGiornoAffollamento == null || ultimoGiornoAffollamento.isBefore(finito)) {
+            aggregaAffollamento(finito);
+            ultimoGiornoAffollamento = finito;
         }
 
         LocalDate limite = oggi().minusDays(GIORNI_CONSERVATI);
@@ -501,15 +516,27 @@ public class PunctualityService {
     }
 
     /**
-     * L'affollamento dei giorni finiti e non ancora sommati, fino all'altro ieri:
-     * le corse notturne di ieri finiscono oggi, e un giorno si somma una volta
-     * sola (CrowdingService). Come per i tratti, un errore non ferma il resto
-     * della manutenzione e si riprova domani.
+     * L'ultimo giorno di servizio che si puo' sommare: ieri, dalle 4 del mattino;
+     * prima delle 4 l'altro ieri, perche' le ultime corse di ieri stanno ancora
+     * finendo. Un giorno si somma una volta sola (CrowdingService), quindi va
+     * preso quando e' completo, ma non piu' tardi: all'inizio si sommava l'altro
+     * ieri anche in pieno giorno, e i dati arrivavano con un giorno di ritardo in
+     * piu' senza guadagnare un passaggio.
      */
-    private void aggregaAffollamento(LocalDate ieri) {
+    static LocalDate ultimoGiornoFinito(ZonedDateTime adesso) {
+        ZonedDateTime aRoma = adesso.withZoneSameInstant(ROMA);
+        return aRoma.toLocalDate().minusDays(aRoma.getHour() >= ORA_GIORNO_FINITO ? 1 : 2);
+    }
+
+    /**
+     * L'affollamento dei giorni finiti e non ancora sommati, fino a `finoA`
+     * compreso. Come per i tratti, un errore non ferma il resto della
+     * manutenzione e si riprova domani.
+     */
+    private void aggregaAffollamento(LocalDate finoA) {
         try {
             long inizio = System.currentTimeMillis();
-            List<LocalDate> giorni = crowding.giorniMancanti(ieri.minusDays(1));
+            List<LocalDate> giorni = crowding.giorniMancanti(finoA);
             int righe = 0;
             for (LocalDate giorno : giorni) {
                 righe += crowding.aggregaGiorno(giorno);
