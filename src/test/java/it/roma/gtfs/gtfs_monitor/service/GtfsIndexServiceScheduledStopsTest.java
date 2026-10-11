@@ -153,6 +153,18 @@ class GtfsIndexServiceScheduledStopsTest {
     }
 
     @Test
+    void nightTripOfYesterdayShowsUpInStopArrivalsAfterMidnight() {
+        // 00:01 del 22/07: la T3 passa da S1 alle 24:05 del giorno di servizio 21/07.
+        // Prima gli arrivi guardavano solo oggi (22, SVC1 non attivo) e domani.
+        Instant now = SERVICE_DATE.plusDays(1).atTime(0, 1).atZone(ROME_ZONE).toInstant();
+
+        List<GtfsIndexService.ScheduledArrival> arrivi = service.scheduledArrivalsForStop("S1", now, 60, 10);
+
+        assertEquals(List.of("T3"), arrivi.stream().map(GtfsIndexService.ScheduledArrival::tripId).toList());
+        assertEquals(4, arrivi.getFirst().etaMinutes());
+    }
+
+    @Test
     void finishedTripOfYesterdayDoesNotHideTodaysNextStops() {
         // Stessa corsa, a corsa finita: le prossime fermate di ieri non esistono
         // piu' e il 22 SVC1 non e' attivo, quindi niente da mostrare.

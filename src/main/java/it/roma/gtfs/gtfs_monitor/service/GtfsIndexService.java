@@ -518,6 +518,12 @@ public class GtfsIndexService {
         long horizonEndEpochSeconds = nowEpochSeconds + (long) horizonMinutes * 60L;
 
         List<ScheduledArrival> out = new ArrayList<>(limit);
+        // Di notte passano ancora le corse del giorno di servizio di ieri (orari
+        // 24:xx-28:59): senza, dopo mezzanotte una fermata servita solo dai
+        // notturni risultava senza arrivi programmati.
+        if (nowRome.getHour() < NIGHT_SERVICE_END_HOUR) {
+            collectScheduledArrivals(out, stopId, nowRome.toLocalDate().minusDays(1), nowEpochSeconds, horizonEndEpochSeconds, limit);
+        }
         collectScheduledArrivals(out, stopId, nowRome.toLocalDate(), nowEpochSeconds, horizonEndEpochSeconds, limit);
 
         LocalDate nextServiceDate = nowRome.toLocalDate().plusDays(1);
@@ -1162,6 +1168,10 @@ public class GtfsIndexService {
         }
 
         long serviceStartEpochSeconds = serviceDayAnchorEpochSeconds(serviceDate);
+        // Il limite vale per giornata e non per il totale: le corse di ieri non
+        // devono togliere il posto a quelle di oggi che passano prima. Ordina e
+        // taglia il chiamante.
+        int added = 0;
         for (ScheduledStopTime stopTime : stopTimes) {
             long etaEpochSeconds = serviceStartEpochSeconds + stopTime.bestTimeSeconds();
             if (etaEpochSeconds < nowEpochSeconds) {
@@ -1181,7 +1191,7 @@ public class GtfsIndexService {
                     (int) Math.max(0L, Math.round((etaEpochSeconds - nowEpochSeconds) / 60.0)),
                     wheelchairAccessible(trip != null ? trip.wheelchair() : null)
             ));
-            if (out.size() >= limit) {
+            if (++added >= limit) {
                 return;
             }
         }
