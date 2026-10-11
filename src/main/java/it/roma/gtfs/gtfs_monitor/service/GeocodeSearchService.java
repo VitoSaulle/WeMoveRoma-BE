@@ -47,18 +47,21 @@ public class GeocodeSearchService {
 
     private final WebClient webClient;
     private final UpstreamGate nominatimGate;
+    /** Lo stesso freno della geocodifica inversa (vedi {@link PhotonGate}). */
+    private final UpstreamGate photonGate;
     private final LongSupplier clock;
     private final Map<String, TimedValue<List<GeocodeSearchResultDTO>>> searchCache = boundedLru(MAX_SEARCH_CACHE_ENTRIES);
     private final Map<String, TimedValue<List<Map<String, Object>>>> upstreamCache = boundedLru(MAX_UPSTREAM_CACHE_ENTRIES);
 
     @Autowired
-    public GeocodeSearchService(WebClient webClient, NominatimGate nominatimGate) {
-        this(webClient, nominatimGate, System::currentTimeMillis);
+    public GeocodeSearchService(WebClient webClient, NominatimGate nominatimGate, PhotonGate photonGate) {
+        this(webClient, nominatimGate, photonGate, System::currentTimeMillis);
     }
 
-    GeocodeSearchService(WebClient webClient, UpstreamGate nominatimGate, LongSupplier clock) {
+    GeocodeSearchService(WebClient webClient, UpstreamGate nominatimGate, UpstreamGate photonGate, LongSupplier clock) {
         this.webClient = webClient;
         this.nominatimGate = nominatimGate;
+        this.photonGate = photonGate;
         this.clock = clock;
     }
 
@@ -260,6 +263,15 @@ public class GeocodeSearchService {
         final String finalQuery = photonQuery;
         String cacheKey = "ph|" + normalizeKey(finalQuery) + "|" + upstreamLimit
                 + "|" + bucketBias(biasLat) + "|" + bucketBias(biasLon);
+        /*
+         * Freno chiuso (intervallo minimo o pausa dopo un rifiuto): niente
+         * richiesta, si usa l'ultima risposta buona se c'e' e si prosegue con
+         * Nominatim, come quando Photon non risponde.
+         */
+        if (!photonGate.tryEnter()) {
+            List<Map<String, Object>> stale = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
+            return new VariantFetch(stale != null ? stale : List.of(), false);
+        }
         try {
             Map<String, Object> payload = webClient.get()
                     .uri(uriBuilder -> {
@@ -280,11 +292,13 @@ public class GeocodeSearchService {
                     .retrieve()
                     .bodyToMono(Map.class)
                     .block(Duration.ofSeconds(6));
+            photonGate.succeeded();
             List<Map<String, Object>> rows = photonFeaturesToRows((Map<String, Object>) payload);
             List<Map<String, Object>> safeRows = List.copyOf(rows);
             upstreamCache.put(cacheKey, new TimedValue<>(safeRows, clock.getAsLong()));
             return new VariantFetch(safeRows, false);
         } catch (WebClientResponseException.TooManyRequests e) {
+            photonGate.refusedBy(e);
             List<Map<String, Object>> stale = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
             if (stale != null) {
                 log.warn("[GeocodeSearch][Photon] 429, using stale cache ({} result(s))", stale.size());
@@ -295,7 +309,7 @@ public class GeocodeSearchService {
         } catch (Exception e) {
             // Photon è un servizio terzo: in caso di errore non blocchiamo la pipeline,
             // proseguiamo con Nominatim e usiamo eventualmente la cache stale di Photon.
-            log.warn("[GeocodeSearch][Photon] failed: {}", e.toString());
+            if (!photonGate.refusedBy(e)) log.warn("[GeocodeSearch][Photon] failed: {}", e.toString());
             List<Map<String, Object>> stale = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
             if (stale != null) {
                 return new VariantFetch(stale, false);

@@ -32,7 +32,6 @@ public class ReverseGeocodeService {
     private static final long FAILURE_TTL_MILLIS = Duration.ofMinutes(2).toMillis();
     /** I mezzi seguiti chiedono un punto nuovo a ogni spostamento: senza tetto la cache cresce e basta. */
     private static final int MAX_CACHE_ENTRIES = 20_000;
-    private static final long PHOTON_MIN_INTERVAL_MILLIS = 500L;
     /** Meta' ciascuno del tetto che aveva Nominatim da solo: nel caso peggiore si aspetta quanto prima. */
     private static final Duration UPSTREAM_TIMEOUT = Duration.ofSeconds(4);
 
@@ -44,9 +43,9 @@ public class ReverseGeocodeService {
     private final Map<String, CacheEntry> cache = new ConcurrentHashMap<>();
 
     @Autowired
-    public ReverseGeocodeService(WebClient webClient, StopAddressService stopAddresses, NominatimGate nominatimGate) {
-        this(webClient, stopAddresses, nominatimGate,
-                new UpstreamGate("Photon", PHOTON_MIN_INTERVAL_MILLIS), System::currentTimeMillis);
+    public ReverseGeocodeService(WebClient webClient, StopAddressService stopAddresses,
+                                 NominatimGate nominatimGate, PhotonGate photonGate) {
+        this(webClient, stopAddresses, nominatimGate, photonGate, System::currentTimeMillis);
     }
 
     ReverseGeocodeService(WebClient webClient, StopAddressService stopAddresses,

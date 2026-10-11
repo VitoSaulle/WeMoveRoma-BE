@@ -49,8 +49,10 @@ class GeocodeSearchServiceTest {
             .build();
     // Il freno di Nominatim non si riapre mai (il tempo dei test avanza solo a mano): resta Photon.
     private final UpstreamGate frenoNominatim = new UpstreamGate("Nominatim", Long.MAX_VALUE / 2, adesso::get);
+    // Qui Photon passa sempre; il freno vero e' provato a parte.
+    private final UpstreamGate frenoPhotonAperto = new UpstreamGate("Photon", 0L, adesso::get);
     private final GeocodeSearchService servizio =
-            new GeocodeSearchService(webClient, frenoNominatim, adesso::get);
+            new GeocodeSearchService(webClient, frenoNominatim, frenoPhotonAperto, adesso::get);
 
     private static ClientResponse json(String body) {
         return ClientResponse.create(HttpStatus.OK)
@@ -82,5 +84,22 @@ class GeocodeSearchServiceTest {
 
         List<GeocodeSearchResultDTO> dopo = servizio.search("via dei grac", 5, null, null);
         assertThat(dopo).extracting(GeocodeSearchResultDTO::label).anyMatch(l -> l.contains("Via dei Gracchi"));
+    }
+
+    @Test
+    @DisplayName("Photon passa dal freno condiviso con la geocodifica inversa: una richiesta ogni mezzo secondo")
+    void photonFrenato() {
+        UpstreamGate frenoPhoton = new UpstreamGate("Photon", 500L, adesso::get);
+        GeocodeSearchService frenato = new GeocodeSearchService(webClient, frenoNominatim, frenoPhoton, adesso::get);
+
+        // La geocodifica inversa ha appena chiamato Photon: la ricerca non lo chiama.
+        assertThat(frenoPhoton.tryEnter()).isTrue();
+        frenato.search("via dei gracchi", 5, null, null);
+        assertThat(chiamate).doesNotContain(PHOTON);
+
+        adesso.addAndGet(500);
+        frenato.search("via dei grac", 5, null, null);
+        frenato.search("via dei gr", 5, null, null);
+        assertThat(chiamate.stream().filter(PHOTON::equals)).hasSize(1);
     }
 }
