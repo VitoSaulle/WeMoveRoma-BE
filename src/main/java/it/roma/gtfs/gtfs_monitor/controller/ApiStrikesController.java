@@ -23,7 +23,10 @@ public class ApiStrikesController {
         return strikeService.snapshot();
     }
 
-    /** Force-refresh manuale (utile per debug). Non protetto: aggiungere auth se serve. */
+    /**
+     * Force-refresh manuale (utile per debug): rilegge il feed e aggiorna la
+     * lista, senza spedire push. Non protetto: per questo non notifica nessuno.
+     */
     @PostMapping("/refresh")
     public List<StrikeDTO> refresh() {
         return strikeService.refreshNow();

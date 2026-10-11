@@ -80,9 +80,15 @@ public class StrikeService {
         return lastSnapshot.get();
     }
 
-    /** Refresh manuale on-demand (utile per testing / admin endpoint). */
+    /**
+     * Refresh manuale on-demand: aggiorna solo i dati, non spedisce push.
+     *
+     * <p>L'endpoint che lo chiama non e' autenticato: prima chiunque poteva far
+     * partire una push verso tutti gli iscritti al topic. Le push partono solo
+     * dai refresh schedulati.
+     */
     public List<StrikeDTO> refreshNow() {
-        return doRefresh(true);
+        return doRefresh(false);
     }
 
     /**

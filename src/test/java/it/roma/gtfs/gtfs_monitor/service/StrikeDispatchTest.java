@@ -70,6 +70,18 @@ class StrikeDispatchTest {
     }
 
     @Test
+    @DisplayName("il refresh manuale (endpoint non autenticato) aggiorna i dati ma non spedisce")
+    void refreshManualeNonSpedisce() {
+        when(fcm.sendToTopic(anyString(), anyString(), anyString(), any())).thenReturn(true);
+
+        assertThat(svc.refreshNow()).hasSize(1);
+
+        verify(fcm, never()).sendToTopic(anyString(), anyString(), anyString(), anyMap());
+        verify(tracker, never()).markSent(anyString());
+        verify(tracker, never()).markAllSent(any());
+    }
+
+    @Test
     @DisplayName("una push fallita non marca lo sciopero: si ritenta al refresh dopo")
     void marcaSoloDopoInvioRiuscito() {
         when(fcm.sendToTopic(anyString(), anyString(), anyString(), any())).thenReturn(false, true);
