@@ -521,7 +521,7 @@ public class GtfsIndexService {
         collectScheduledArrivals(out, stopId, nowRome.toLocalDate(), nowEpochSeconds, horizonEndEpochSeconds, limit);
 
         LocalDate nextServiceDate = nowRome.toLocalDate().plusDays(1);
-        long nextServiceStartEpochSeconds = nextServiceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
+        long nextServiceStartEpochSeconds = serviceDayAnchorEpochSeconds(nextServiceDate);
         if (out.size() < limit && horizonEndEpochSeconds >= nextServiceStartEpochSeconds) {
             collectScheduledArrivals(out, stopId, nextServiceDate, nowEpochSeconds, horizonEndEpochSeconds, limit);
         }
@@ -1161,7 +1161,7 @@ public class GtfsIndexService {
             return;
         }
 
-        long serviceStartEpochSeconds = serviceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
+        long serviceStartEpochSeconds = serviceDayAnchorEpochSeconds(serviceDate);
         for (ScheduledStopTime stopTime : stopTimes) {
             long etaEpochSeconds = serviceStartEpochSeconds + stopTime.bestTimeSeconds();
             if (etaEpochSeconds < nowEpochSeconds) {
@@ -1361,7 +1361,7 @@ public class GtfsIndexService {
             List<ShapePoint> shape = shapeByTripId(schedule.tripId());
             if (shape.size() < 2) continue;
 
-            long serviceStartEpochSeconds = serviceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
+            long serviceStartEpochSeconds = serviceDayAnchorEpochSeconds(serviceDate);
             long startEpochSeconds = serviceStartEpochSeconds + schedule.startTimeSeconds();
             long endEpochSeconds = serviceStartEpochSeconds + schedule.endTimeSeconds();
             if (endEpochSeconds < nowEpochSeconds - 5 * 60L) continue;
@@ -1395,7 +1395,7 @@ public class GtfsIndexService {
             return Optional.empty();
         }
 
-        long serviceStartEpochSeconds = serviceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
+        long serviceStartEpochSeconds = serviceDayAnchorEpochSeconds(serviceDate);
         long startEpochSeconds = serviceStartEpochSeconds + schedule.startTimeSeconds();
         long endEpochSeconds = serviceStartEpochSeconds + schedule.endTimeSeconds();
         if (endEpochSeconds < nowEpochSeconds - 5 * 60L) {
@@ -1435,7 +1435,7 @@ public class GtfsIndexService {
             return List.of();
         }
 
-        long serviceStartEpochSeconds = serviceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
+        long serviceStartEpochSeconds = serviceDayAnchorEpochSeconds(serviceDate);
         List<ScheduledTripStop> out = new ArrayList<>(Math.min(limit, rows.size()));
         for (StopTimeRow row : rows) {
             Integer bestTimeSeconds = row.arrivalTimeSeconds() != null ? row.arrivalTimeSeconds() : row.departureTimeSeconds();
@@ -1471,7 +1471,7 @@ public class GtfsIndexService {
             return List.of();
         }
 
-        long serviceStartEpochSeconds = serviceDate.atStartOfDay(ROME_ZONE).toEpochSecond();
+        long serviceStartEpochSeconds = serviceDayAnchorEpochSeconds(serviceDate);
         List<ScheduledTripStop> out = new ArrayList<>(rows.size());
         for (StopTimeRow row : rows) {
             out.add(toScheduledTripStop(trip, row, serviceStartEpochSeconds));
@@ -1939,6 +1939,19 @@ public class GtfsIndexService {
                 .trim()
                 .replaceAll("\\s+", " ");
         return normalized.isEmpty() ? null : normalized;
+    }
+
+    /**
+     * Istante da cui si contano gli orari GTFS di una giornata di servizio.
+     *
+     * <p>Non e' la mezzanotte: la specifica dice "mezzogiorno meno 12 ore". Nei
+     * giorni normali coincidono; nei due giorni del cambio d'ora no. Il 25/10
+     * (si torna all'ora solare) mezzogiorno meno 12h e' l'una di notte, e una
+     * corsa scritta 08:00 parte alle 08:00 vere; contando dalla mezzanotte la si
+     * dava alle 07:00. Il 29/03 l'errore e' opposto: un'ora in piu'.
+     */
+    static long serviceDayAnchorEpochSeconds(LocalDate serviceDate) {
+        return serviceDate.atTime(12, 0).atZone(ROME_ZONE).minusHours(12).toEpochSecond();
     }
 
     private static Instant toInstantOrNull(long serviceStartEpochSeconds, Integer timeSeconds) {
