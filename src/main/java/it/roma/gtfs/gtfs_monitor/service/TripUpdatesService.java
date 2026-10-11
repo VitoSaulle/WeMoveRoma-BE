@@ -130,13 +130,21 @@ public class TripUpdatesService {
         refreshCache(true);
     }
 
+    /**
+     * Con dati in cache si serve quello che c'e': a scaricare ci pensa solo il
+     * poll schedulato. Stesso motivo di {@code VehiclePositionsService}: prima,
+     * con l'upstream giu', ogni richiesta HTTP rifaceva il suo download
+     * bloccante in fila dietro il lock. La richiesta scarica solo a freddo,
+     * e al massimo una volta per intervallo.
+     */
     private List<TripUpdateDTO> getCachedOrRefresh() {
         CacheEntry<List<TripUpdateDTO>> current = cacheRef.get();
-        if (!isExpired(current)) {
+        if (!current.isEmpty()) {
             return current.data();
         }
         refreshCache(false);
-        return cacheRef.get().data();
+        List<TripUpdateDTO> data = cacheRef.get().data();
+        return data != null ? data : List.of();
     }
 
     private void refreshCache(boolean force) {
@@ -145,18 +153,30 @@ public class TripUpdatesService {
             if (!force && !isExpired(current)) {
                 return;
             }
+            long now = System.currentTimeMillis();
+            Optional<List<TripUpdateDTO>> fetched = Optional.empty();
             try {
-                List<TripUpdateDTO> fresh = fetchRemoteSnapshot();
-                if (!fresh.isEmpty() || current.isEmpty()) {
-                    cacheRef.set(new CacheEntry<>(List.copyOf(fresh), System.currentTimeMillis()));
-                }
+                fetched = fetchRemoteSnapshot();
             } catch (Exception e) {
                 log.warn("[TripUpdates] refresh cache fallito: {}", e.toString());
+            }
+            if (fetched.isEmpty()) {
+                // Fallimento: si annota il tentativo, cosi' la cache conta come
+                // fresca per un altro intervallo e nessuno ritenta prima.
+                cacheRef.set(current.withAttempt(now));
+                return;
+            }
+            List<TripUpdateDTO> fresh = fetched.get();
+            if (!fresh.isEmpty() || current.isEmpty()) {
+                cacheRef.set(new CacheEntry<>(List.copyOf(fresh), now, now));
+            } else {
+                cacheRef.set(current.withAttempt(now));
             }
         }
     }
 
-    private List<TripUpdateDTO> fetchRemoteSnapshot() {
+    /** @return l'istantanea scaricata, oppure vuoto se il download e' fallito. */
+    private Optional<List<TripUpdateDTO>> fetchRemoteSnapshot() {
         String url = props.realtime().tripUpdatesUrl();
         if (url == null || url.isBlank()) {
             throw new IllegalStateException("gtfs.realtime.tripUpdatesUrl mancante");
@@ -169,13 +189,13 @@ public class TripUpdatesService {
             } catch (InvalidProtocolBufferException e) {
                 if (attempt >= 2) {
                     log.error("[TripUpdates] parse error anche al retry: {}", e.toString());
-                    return List.of();
+                    return Optional.empty();
                 }
                 log.warn("[TripUpdates] protobuf corrotto (tentativo {}), retry immediato: {}", attempt, e.toString());
             } catch (WebClientResponseException.BadGateway | WebClientRequestException e) {
                 if (attempt >= 2) {
                     log.warn("[TripUpdates] refresh cache fallito anche al retry: {}", e.toString());
-                    return List.of();
+                    return Optional.empty();
                 }
                 log.warn("[TripUpdates] upstream temporaneamente non disponibile (tentativo {}), retry immediato: {}", attempt, e.toString());
             } catch (WebClientResponseException.Forbidden | WebClientResponseException.TooManyRequests e) {
@@ -186,10 +206,10 @@ public class TripUpdatesService {
                  * cache precedente resta servita, quindi nessuno se ne accorge.
                  */
                 log.warn("[TripUpdates] poll respinto dall'upstream, servo la cache precedente: {}", e.toString());
-                return List.of();
+                return Optional.empty();
             } catch (Exception e) {
                 log.error("[TripUpdates] fetch/parsing error: {}", e.toString());
-                return List.of();
+                return Optional.empty();
             }
 
             attempt++;
@@ -197,15 +217,16 @@ public class TripUpdatesService {
         }
     }
 
-    private List<TripUpdateDTO> fetchRemoteSnapshotOnce(String url) throws InvalidProtocolBufferException {
+    private Optional<List<TripUpdateDTO>> fetchRemoteSnapshotOnce(String url) throws InvalidProtocolBufferException {
         byte[] body = webClient.get().uri(url)
                 .retrieve()
                 .bodyToMono(byte[].class)
                 .block(FEED_BLOCK_TIMEOUT);
 
         if (body == null || body.length == 0) {
+            // Un feed valido ha sempre almeno l'header: un body vuoto e' un guasto.
             log.warn("[TripUpdates] body vuoto da {}", url);
-            return List.of();
+            return Optional.empty();
         }
 
         var feed = GtfsRealtime.FeedMessage.parseFrom(body);
@@ -252,7 +273,7 @@ public class TripUpdatesService {
                         .build());
             }
         }
-        return out;
+        return Optional.of(out);
     }
 
     private static void sleepBeforeRetry() {
@@ -263,8 +284,9 @@ public class TripUpdatesService {
         }
     }
 
+    /** Scaduta = l'ultimo tentativo, riuscito o no, e' piu' vecchio di un intervallo. */
     private boolean isExpired(CacheEntry<?> entry) {
-        return entry.isEmpty() || (System.currentTimeMillis() - entry.loadedAtMillis()) > refreshMillis();
+        return (System.currentTimeMillis() - entry.attemptedAtMillis()) > refreshMillis();
     }
 
     private long refreshMillis() {
@@ -300,9 +322,17 @@ public class TripUpdatesService {
         }
     }
 
-    private record CacheEntry<T>(T data, long loadedAtMillis) {
+    /**
+     * @param loadedAtMillis    quando sono arrivati i dati serviti
+     * @param attemptedAtMillis ultimo tentativo di download, anche fallito
+     */
+    private record CacheEntry<T>(T data, long loadedAtMillis, long attemptedAtMillis) {
         private static <T> CacheEntry<T> empty() {
-            return new CacheEntry<>(null, 0L);
+            return new CacheEntry<>(null, 0L, 0L);
+        }
+
+        private CacheEntry<T> withAttempt(long attemptedAt) {
+            return new CacheEntry<>(data, loadedAtMillis, attemptedAt);
         }
 
         private boolean isEmpty() {

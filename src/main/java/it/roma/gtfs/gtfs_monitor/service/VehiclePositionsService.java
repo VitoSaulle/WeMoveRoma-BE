@@ -86,8 +86,8 @@ public class VehiclePositionsService {
 
     public Instant lastSnapshotAt() {
         CacheEntry<List<VehiclePositionDTO>> current = cacheRef.get();
-        if (isExpired(current)) {
-            refreshCache(false);
+        if (current.isEmpty()) {
+            getCachedOrRefresh();
             current = cacheRef.get();
         }
         return current.isEmpty() ? null : Instant.ofEpochMilli(current.loadedAtMillis());
@@ -110,13 +110,25 @@ public class VehiclePositionsService {
         refreshCache(true);
     }
 
+    /**
+     * Con dati in cache si serve quello che c'e', anche se di qualche secondo piu'
+     * vecchio dell'intervallo: a scaricare ci pensa solo il poll schedulato.
+     *
+     * <p>Prima ogni richiesta che trovava la cache scaduta scaricava da se',
+     * in fila dietro il lock. Bastava un upstream giu': il fallimento non
+     * aggiornava l'ora di caricamento, la cache restava "scaduta" e ogni
+     * richiesta HTTP rifaceva il suo download bloccante (con retry), una dopo
+     * l'altra. Ora la richiesta scarica solo a freddo, quando non c'e' ancora
+     * niente da servire, e anche allora al massimo un tentativo per intervallo.
+     */
     private List<VehiclePositionDTO> getCachedOrRefresh() {
         CacheEntry<List<VehiclePositionDTO>> current = cacheRef.get();
-        if (!isExpired(current)) {
+        if (!current.isEmpty()) {
             return current.data();
         }
         refreshCache(false);
-        return cacheRef.get().data();
+        List<VehiclePositionDTO> data = cacheRef.get().data();
+        return data != null ? data : List.of();
     }
 
     private void refreshCache(boolean force) {
@@ -125,16 +137,26 @@ public class VehiclePositionsService {
             if (!force && !isExpired(current)) {
                 return;
             }
+            long now = System.currentTimeMillis();
+            Optional<List<VehiclePositionDTO>> fetched = Optional.empty();
             try {
-                List<VehiclePositionDTO> fresh = fetchRemoteSnapshot();
-                if (!fresh.isEmpty() || current.isEmpty()) {
-                    long loadedAt = System.currentTimeMillis();
-                    List<VehiclePositionDTO> immutable = List.copyOf(fresh);
-                    cacheRef.set(new CacheEntry<>(immutable, loadedAt));
-                    vehiclePositionsSseService.publish(immutable, Instant.ofEpochMilli(loadedAt));
-                }
+                fetched = fetchRemoteSnapshot();
             } catch (Exception e) {
                 log.warn("[VehiclePositions] refresh cache fallito: {}", e.toString());
+            }
+            if (fetched.isEmpty()) {
+                // Fallimento: si annota il tentativo, cosi' la cache conta come
+                // fresca per un altro intervallo e nessuno ritenta prima.
+                cacheRef.set(current.withAttempt(now));
+                return;
+            }
+            List<VehiclePositionDTO> fresh = fetched.get();
+            if (!fresh.isEmpty() || current.isEmpty()) {
+                List<VehiclePositionDTO> immutable = List.copyOf(fresh);
+                cacheRef.set(new CacheEntry<>(immutable, now, now));
+                vehiclePositionsSseService.publish(immutable, Instant.ofEpochMilli(now));
+            } else {
+                cacheRef.set(current.withAttempt(now));
             }
         }
     }
@@ -149,7 +171,8 @@ public class VehiclePositionsService {
      * saltavano un ciclo e il log si riempiva di ERROR per un guasto passeggero
      * di cui il codice sa gia' riprendersi.
      */
-    private List<VehiclePositionDTO> fetchRemoteSnapshot() {
+    /** @return l'istantanea scaricata, oppure vuoto se il download e' fallito. */
+    private Optional<List<VehiclePositionDTO>> fetchRemoteSnapshot() {
         int attempt = 1;
         while (true) {
             try {
@@ -157,13 +180,13 @@ public class VehiclePositionsService {
             } catch (InvalidProtocolBufferException e) {
                 if (attempt >= 2) {
                     log.error("[VehiclePositions] feed protobuf corrotto anche al retry: {}", e.toString());
-                    return List.of();
+                    return Optional.empty();
                 }
                 log.warn("[VehiclePositions] protobuf corrotto (tentativo {}), retry immediato: {}", attempt, e.toString());
             } catch (WebClientResponseException.BadGateway | WebClientRequestException e) {
                 if (attempt >= 2) {
                     log.warn("[VehiclePositions] refresh cache fallito anche al retry: {}", e.toString());
-                    return List.of();
+                    return Optional.empty();
                 }
                 log.warn("[VehiclePositions] upstream temporaneamente non disponibile (tentativo {}), retry immediato: {}", attempt, e.toString());
             } catch (WebClientResponseException.Forbidden | WebClientResponseException.TooManyRequests e) {
@@ -174,10 +197,10 @@ public class VehiclePositionsService {
                  * cache precedente resta servita, quindi nessuno se ne accorge.
                  */
                 log.warn("[VehiclePositions] poll respinto dall'upstream, servo la cache precedente: {}", e.toString());
-                return List.of();
+                return Optional.empty();
             } catch (Exception e) {
                 log.error("[VehiclePositions] fetch/parsing error: {}", e.toString());
-                return List.of();
+                return Optional.empty();
             }
 
             attempt++;
@@ -193,7 +216,7 @@ public class VehiclePositionsService {
         }
     }
 
-    private List<VehiclePositionDTO> fetchRemoteSnapshotOnce() throws InvalidProtocolBufferException {
+    private Optional<List<VehiclePositionDTO>> fetchRemoteSnapshotOnce() throws InvalidProtocolBufferException {
         String url = Objects.requireNonNull(props.realtime().vehiclePositionsUrl(),
                 "gtfs.realtime.vehiclePositionsUrl mancante");
 
@@ -204,8 +227,9 @@ public class VehiclePositionsService {
                 .block(FEED_BLOCK_TIMEOUT);
 
         if (body == null || body.length == 0) {
+            // Un feed valido ha sempre almeno l'header: un body vuoto e' un guasto.
             log.warn("[VehiclePositions] body vuoto da {}", url);
-            return List.of();
+            return Optional.empty();
         }
 
         var feed = GtfsRealtime.FeedMessage.parseFrom(body);
@@ -250,7 +274,7 @@ public class VehiclePositionsService {
                     .wheelchairAccessible(wheelchairAccessible)
                     .build());
         }
-        return out;
+        return Optional.of(out);
     }
 
     private static Boolean wheelchairAccessible(GtfsIndexService.Trip trip) {
@@ -260,8 +284,9 @@ public class VehiclePositionsService {
         return null;
     }
 
+    /** Scaduta = l'ultimo tentativo, riuscito o no, e' piu' vecchio di un intervallo. */
     private boolean isExpired(CacheEntry<?> entry) {
-        return entry.isEmpty() || (System.currentTimeMillis() - entry.loadedAtMillis()) > refreshMillis();
+        return (System.currentTimeMillis() - entry.attemptedAtMillis()) > refreshMillis();
     }
 
     private long refreshMillis() {
@@ -346,9 +371,17 @@ public class VehiclePositionsService {
         return new Position(lat, lon);
     }
 
-    private record CacheEntry<T>(T data, long loadedAtMillis) {
+    /**
+     * @param loadedAtMillis    quando sono arrivati i dati serviti
+     * @param attemptedAtMillis ultimo tentativo di download, anche fallito
+     */
+    private record CacheEntry<T>(T data, long loadedAtMillis, long attemptedAtMillis) {
         private static <T> CacheEntry<T> empty() {
-            return new CacheEntry<>(null, 0L);
+            return new CacheEntry<>(null, 0L, 0L);
+        }
+
+        private CacheEntry<T> withAttempt(long attemptedAt) {
+            return new CacheEntry<>(data, loadedAtMillis, attemptedAt);
         }
 
         private boolean isEmpty() {
