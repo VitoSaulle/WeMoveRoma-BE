@@ -341,6 +341,8 @@ public class PunctualityService {
         try {
             Flyway.configure().dataSource(dataSource).locations("classpath:db/migration").load().migrate();
             schemaPronto = true;
+            slowSegments.segnaSchemaPronto();
+            crowding.segnaSchemaPronto();
             log.info("[Puntualita] database pronto");
             return true;
         } catch (RuntimeException e) {

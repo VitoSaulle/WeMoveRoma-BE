@@ -72,6 +72,7 @@ public class SlowSegmentsService {
     /** In lettura, sotto questo numero di corse sull'intero periodo il tratto non si mostra. */
     static final int CORSE_MINIME_PERIODO = 10;
     private static final int RISPOSTE_IN_MEMORIA = 48;
+    private static final long INTERVALLO_AVVISI_MILLIS = 10 * 60 * 1000L;
 
     private final JdbcTemplate jdbc;
     private final GtfsIndexService gtfs;
@@ -87,6 +88,14 @@ public class SlowSegmentsService {
     /** Strada fra due fermate, per la versione del GTFS in `versioneGeometrie`. */
     private final Map<String, List<double[]>> geometrie = new ConcurrentHashMap<>();
     private volatile Instant versioneGeometrie = Instant.EPOCH;
+
+    /**
+     * Lo segna PunctualityService quando la migrazione Flyway e' riuscita, come
+     * il suo schemaPronto: prima, con Postgres spento, ogni richiesta
+     * aspetterebbe il timeout del pool (2 secondi, 4 connessioni) per nulla.
+     */
+    private volatile boolean schemaPronto;
+    private volatile long ultimoAvvisoMillis;
 
     private record Risposta(long aggregato, Instant gtfs, ApiSlowSegmentsDTO dto) {}
 
@@ -176,6 +185,22 @@ public class SlowSegmentsService {
 
     // ---- lettura ---------------------------------------------------------------
 
+    /** Da PunctualityService, quando lo schema e' pronto. */
+    void segnaSchemaPronto() {
+        schemaPronto = true;
+    }
+
+    /** Un database spento produrrebbe un avviso a ogni richiesta: al massimo uno ogni dieci minuti. */
+    private void avvisa(String cosa, Exception e) {
+        long adesso = System.currentTimeMillis();
+        if (adesso - ultimoAvvisoMillis > INTERVALLO_AVVISI_MILLIS) {
+            ultimoAvvisoMillis = adesso;
+            log.warn("[Tratti] {}: {}", cosa, e.toString());
+        } else {
+            log.debug("[Tratti] {}: {}", cosa, e.toString());
+        }
+    }
+
     /**
      * I tratti in cui si perde tempo, per tipo di giorno (ServiceDayType) e fascia
      * (una di FASCE, o TUTTE), fra due date comprese. Con `linea`, solo i tratti
@@ -185,7 +210,7 @@ public class SlowSegmentsService {
      * funzione disattivata.
      */
     public Optional<ApiSlowSegmentsDTO> tratti(String tipo, String fascia, LocalDate dal, LocalDate al, String linea) {
-        if (!enabled) {
+        if (!enabled || !schemaPronto) {
             return Optional.empty();
         }
         String chiave = tipo + "|" + fascia + "|" + dal + "|" + al + "|" + (linea == null ? "" : linea);
@@ -201,7 +226,7 @@ public class SlowSegmentsService {
         try {
             periodo = leggi(giorni, fascia, linea);
         } catch (DataAccessException e) {
-            log.warn("[Tratti] lettura fallita: {}", e.toString());
+            avvisa("lettura fallita", e);
             return Optional.empty();
         }
 

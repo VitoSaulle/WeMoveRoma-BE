@@ -79,6 +79,7 @@ public class CrowdingService {
     /** Una risposta con tutta la rete pesa qualche MB: se ne tengono poche. */
     private static final int RISPOSTE_RETE_IN_MEMORIA = 6;
     private static final int RISPOSTE_LINEA_IN_MEMORIA = 48;
+    private static final long INTERVALLO_AVVISI_MILLIS = 10 * 60 * 1000L;
 
     private final JdbcTemplate jdbc;
     private final GtfsIndexService gtfs;
@@ -103,6 +104,14 @@ public class CrowdingService {
     private final Map<String, Risposta> risposteRete = new ConcurrentHashMap<>();
     private final Map<String, Risposta> risposteLinea = new ConcurrentHashMap<>();
     private volatile TransactionTemplate transazione;
+
+    /**
+     * Lo segna PunctualityService quando la migrazione Flyway e' riuscita, come
+     * il suo schemaPronto: prima, con Postgres spento, ogni richiesta
+     * aspetterebbe il timeout del pool (2 secondi, 4 connessioni) per nulla.
+     */
+    private volatile boolean schemaPronto;
+    private volatile long ultimoAvvisoMillis;
 
     private record Risposta(long aggregato, Instant gtfs, ApiCrowdingSegmentsDTO dto) {}
 
@@ -227,6 +236,22 @@ public class CrowdingService {
 
     // ---- lettura ---------------------------------------------------------------
 
+    /** Da PunctualityService, quando lo schema e' pronto. */
+    void segnaSchemaPronto() {
+        schemaPronto = true;
+    }
+
+    /** Un database spento produrrebbe un avviso a ogni richiesta: al massimo uno ogni dieci minuti. */
+    private void avvisa(String cosa, Exception e) {
+        long adesso = System.currentTimeMillis();
+        if (adesso - ultimoAvvisoMillis > INTERVALLO_AVVISI_MILLIS) {
+            ultimoAvvisoMillis = adesso;
+            log.warn("[Affollamento] {}: {}", cosa, e.toString());
+        } else {
+            log.debug("[Affollamento] {}: {}", cosa, e.toString());
+        }
+    }
+
     /**
      * L'affollamento per tratto e ora, per un tipo di giorno (ServiceDayType),
      * sugli ultimi `mesi` mesi compreso quello in corso. Con `linea`, solo i suoi
@@ -234,7 +259,7 @@ public class CrowdingService {
      * funzione disattivata.
      */
     public Optional<ApiCrowdingSegmentsDTO> tratti(String tipo, int mesi, String linea) {
-        if (!enabled) {
+        if (!enabled || !schemaPronto) {
             return Optional.empty();
         }
         YearMonth ultimo = YearMonth.from(PunctualityService.oggi());
@@ -252,7 +277,7 @@ public class CrowdingService {
         try {
             periodo = leggi(tipo, primo, ultimo, linea);
         } catch (DataAccessException e) {
-            log.warn("[Affollamento] lettura fallita: {}", e.toString());
+            avvisa("lettura fallita", e);
             return Optional.empty();
         }
 
