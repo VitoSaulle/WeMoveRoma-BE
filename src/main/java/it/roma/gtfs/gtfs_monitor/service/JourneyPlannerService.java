@@ -205,6 +205,11 @@ public class JourneyPlannerService {
                 preference, modesClause, upstreamLimit, searchWindow
         );
 
+        // null = OTP non ha risposto (eccezione/timeout): inutile ritentare con la finestra larga.
+        if (rawOptions == null) {
+            return otpNonRaggiungibile(from, to);
+        }
+
         // Fallback con searchWindow allargata se la prima ricerca è vuota
         boolean fallbackUsed = false;
         if (rawOptions.isEmpty() && !searchWindow.equals(searchWindowFallback)) {
@@ -215,15 +220,11 @@ public class JourneyPlannerService {
                     toLat, toLon, toLabel,
                     preference, modesClause, upstreamLimit, searchWindowFallback
             );
+            // OTP puo' cadere anche fra la prima ricerca e il fallback.
+            if (rawOptions == null) {
+                return otpNonRaggiungibile(from, to);
+            }
             fallbackUsed = !rawOptions.isEmpty();
-        }
-
-        if (rawOptions == null) {
-            return new JourneyPlanResponseDTO(
-                    "otp", from, to, List.of(),
-                    "Trip planner non raggiungibile. Verifica server OTP.",
-                    Instant.now()
-            );
         }
 
         List<JourneyOptionDTO> options = dedupeAndEnrich(rawOptions, requested);
@@ -251,6 +252,15 @@ public class JourneyPlannerService {
         return new JourneyPlanResponseDTO("otp", from, to, options, error, now);
     }
 
+    private static JourneyPlanResponseDTO otpNonRaggiungibile(JourneyLocationDTO from, JourneyLocationDTO to) {
+        return new JourneyPlanResponseDTO(
+                "otp", from, to, List.of(),
+                "Trip planner non raggiungibile. Verifica server OTP.",
+                Instant.now()
+        );
+    }
+
+    /** Opzioni trovate da OTP (vuota se nessuna), null se OTP non risponde. */
     @SuppressWarnings("unchecked")
     private List<JourneyOptionDTO> executeQuery(
             double fromLat, double fromLon, String fromLabel,

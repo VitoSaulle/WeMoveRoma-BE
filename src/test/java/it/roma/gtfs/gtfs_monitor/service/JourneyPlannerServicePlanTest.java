@@ -11,7 +11,11 @@ import org.springframework.web.reactive.function.client.ExchangeFunction;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Mono;
 
+import java.io.IOException;
+import java.util.concurrent.atomic.AtomicInteger;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 
 /**
@@ -19,6 +23,8 @@ import static org.mockito.Mockito.mock;
  * o per OTP giu', ma la risposta con il messaggio d'errore giusto.
  */
 class JourneyPlannerServicePlanTest {
+
+    private static final String NON_RAGGIUNGIBILE = "Trip planner non raggiungibile. Verifica server OTP.";
 
     private static JourneyPlannerService planner(ExchangeFunction otp) {
         JourneyPlannerService service = new JourneyPlannerService(
@@ -59,5 +65,39 @@ class JourneyPlannerServicePlanTest {
 
         assertEquals("Nessun percorso trovato.", senza.error());
         assertEquals("Nessun percorso trovato.", vuoto.error());
+    }
+
+    @Test
+    void otpGiuAllaPrimaRicercaNonVaInErrore() {
+        AtomicInteger chiamate = new AtomicInteger();
+        JourneyPlannerService service = planner(request -> {
+            chiamate.incrementAndGet();
+            return Mono.error(new IOException("Connection refused"));
+        });
+
+        JourneyPlanResponseDTO risposta = daTerminiAPiazzaVenezia(service);
+
+        assertEquals(NON_RAGGIUNGIBILE, risposta.error());
+        assertTrue(risposta.options().isEmpty());
+        // Se OTP non risponde non si ritenta con la finestra larga.
+        assertEquals(1, chiamate.get());
+    }
+
+    @Test
+    void otpCheCadePrimaDelFallbackNonVaInErrore() {
+        AtomicInteger chiamate = new AtomicInteger();
+        JourneyPlannerService service = planner(request -> {
+            if (chiamate.incrementAndGet() == 1) {
+                // Prima ricerca: OTP risponde ma non trova nulla.
+                return Mono.just(nessunPercorso());
+            }
+            return Mono.error(new IOException("Connection refused"));
+        });
+
+        JourneyPlanResponseDTO risposta = daTerminiAPiazzaVenezia(service);
+
+        assertEquals(NON_RAGGIUNGIBILE, risposta.error());
+        assertTrue(risposta.options().isEmpty());
+        assertEquals(2, chiamate.get());
     }
 }
