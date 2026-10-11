@@ -316,8 +316,14 @@ public class PunctualityService {
                 scriviCorse();
             }
             if (System.currentTimeMillis() - ultimaManutenzioneMillis > 60 * 60 * 1000L) {
-                manutenzione();
-                ultimaManutenzioneMillis = System.currentTimeMillis();
+                // Anche se fallisce: la manutenzione e' pesante (due giorni di
+                // passaggi, DDL delle partizioni) e ripeterla ogni 15 secondi
+                // caricherebbe un database gia' in difficolta'. Si riprova fra un'ora.
+                try {
+                    manutenzione();
+                } finally {
+                    ultimaManutenzioneMillis = System.currentTimeMillis();
+                }
             }
             long persi = scartati.getAndSet(0);
             if (persi > 0) {
