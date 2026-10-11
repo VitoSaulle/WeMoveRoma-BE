@@ -49,6 +49,13 @@ public class RailTrainInfoService {
     private static final ZoneId ROME_ZONE = ZoneId.of("Europe/Rome");
     /** Ogni chiave vive 45 secondi, ma senza tetto quelle scadute restavano in memoria per sempre. */
     static final int MAX_CACHE_ENTRIES = 2_000;
+    private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(12);
+    /*
+     * Tetto all'intera ricerca: ricerca, una richiesta per ogni candidato e la
+     * pagina HTML di ripiego vanno in fila, ognuna fino a 12 secondi, e con
+     * Viaggiatreno lento il thread della richiesta restava fermo per minuti.
+     */
+    static final Duration LOOKUP_BUDGET = Duration.ofSeconds(20);
 
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
@@ -96,8 +103,9 @@ public class RailTrainInfoService {
     }
 
     private RailTrainInfoDTO fetchTrainInfo(String trainNumber, String stationName, OffsetDateTime referenceTime) {
+        Instant deadline = Instant.now().plus(LOOKUP_BUDGET);
         try {
-            RailTrainInfoDTO apiParsed = fetchTrainInfoFromApi(trainNumber, stationName, referenceTime);
+            RailTrainInfoDTO apiParsed = fetchTrainInfoFromApi(trainNumber, stationName, referenceTime, deadline);
             if (apiParsed != null) {
                 return apiParsed;
             }
@@ -106,6 +114,11 @@ public class RailTrainInfoService {
         }
 
         if (!canUseHtmlFallback(referenceTime)) {
+            return null;
+        }
+        Duration timeout = timeoutWithin(deadline);
+        if (timeout == null) {
+            log.debug("[RailTrainInfo] Viaggiatreno lookup for {} out of time, no HTML fallback", trainNumber);
             return null;
         }
 
@@ -122,7 +135,7 @@ public class RailTrainInfoService {
                     .header("User-Agent", "Mozilla/5.0 (compatible; WeMoveRoma/1.0)")
                     .retrieve()
                     .bodyToMono(String.class)
-                    .block(Duration.ofSeconds(12));
+                    .block(timeout);
 
             if (html == null || html.isBlank()) {
                 return null;
@@ -148,8 +161,14 @@ public class RailTrainInfoService {
                 .equals(OffsetDateTime.now(ROME_ZONE).toLocalDate());
     }
 
-    private RailTrainInfoDTO fetchTrainInfoFromApi(String trainNumber, String stationName, OffsetDateTime referenceTime) throws Exception {
-        List<TrainSearchCandidate> candidates = fetchSearchCandidates(trainNumber);
+    private RailTrainInfoDTO fetchTrainInfoFromApi(
+            String trainNumber, String stationName, OffsetDateTime referenceTime, Instant deadline
+    ) {
+        Duration searchTimeout = timeoutWithin(deadline);
+        if (searchTimeout == null) {
+            return null;
+        }
+        List<TrainSearchCandidate> candidates = fetchSearchCandidates(trainNumber, searchTimeout);
         if (candidates.isEmpty()) {
             return null;
         }
@@ -157,7 +176,21 @@ public class RailTrainInfoService {
         RailTrainInfoDTO best = null;
         int bestScore = Integer.MIN_VALUE;
         for (TrainSearchCandidate candidate : candidates) {
-            RailTrainInfoDTO parsed = fetchTrainInfoForCandidate(candidate, stationName);
+            Duration timeout = timeoutWithin(deadline);
+            if (timeout == null) {
+                // Tempo finito: vale il migliore trovato fin qui.
+                log.debug("[RailTrainInfo] Viaggiatreno lookup for {} out of time", trainNumber);
+                break;
+            }
+            RailTrainInfoDTO parsed;
+            try {
+                parsed = fetchTrainInfoForCandidate(candidate, stationName, timeout);
+            } catch (Exception ex) {
+                // Un candidato che non risponde, o risponde male, non butta via gli altri.
+                log.debug("[RailTrainInfo] Viaggiatreno candidate {}-{} failed: {}",
+                        candidate.trainNumber(), candidate.originCode(), ex.toString());
+                continue;
+            }
             if (parsed == null) {
                 continue;
             }
@@ -171,7 +204,16 @@ public class RailTrainInfoService {
         return bestScore > Integer.MIN_VALUE ? best : null;
     }
 
-    private List<TrainSearchCandidate> fetchSearchCandidates(String trainNumber) {
+    /** Quanto puo' aspettare la prossima richiesta: al massimo 12 secondi, e null se il tempo e' finito. */
+    private static Duration timeoutWithin(Instant deadline) {
+        Duration remaining = Duration.between(Instant.now(), deadline);
+        if (remaining.isNegative() || remaining.isZero()) {
+            return null;
+        }
+        return remaining.compareTo(REQUEST_TIMEOUT) < 0 ? remaining : REQUEST_TIMEOUT;
+    }
+
+    private List<TrainSearchCandidate> fetchSearchCandidates(String trainNumber, Duration timeout) {
         String payload = webClient.get()
                 .uri(UriComponentsBuilder.fromUriString(viaggiatrenoApiBaseUrl)
                         .path("/infomobilita/resteasy/viaggiatreno/cercaNumeroTrenoTrenoAutocomplete/")
@@ -182,7 +224,7 @@ public class RailTrainInfoService {
                 .header("User-Agent", "Mozilla/5.0 (compatible; WeMoveRoma/1.0)")
                 .retrieve()
                 .bodyToMono(String.class)
-                .block(Duration.ofSeconds(12));
+                .block(timeout);
 
         if (payload == null || payload.isBlank()) {
             return List.of();
@@ -212,7 +254,9 @@ public class RailTrainInfoService {
         return candidates;
     }
 
-    private RailTrainInfoDTO fetchTrainInfoForCandidate(TrainSearchCandidate candidate, String stationName) throws Exception {
+    private RailTrainInfoDTO fetchTrainInfoForCandidate(
+            TrainSearchCandidate candidate, String stationName, Duration timeout
+    ) throws Exception {
         String payload = webClient.get()
                 .uri(UriComponentsBuilder.fromUriString(viaggiatrenoApiBaseUrl)
                         .path("/infomobilita/resteasy/viaggiatreno/andamentoTreno/")
@@ -227,7 +271,7 @@ public class RailTrainInfoService {
                 .header("User-Agent", "Mozilla/5.0 (compatible; WeMoveRoma/1.0)")
                 .retrieve()
                 .bodyToMono(String.class)
-                .block(Duration.ofSeconds(12));
+                .block(timeout);
 
         if (payload == null || payload.isBlank()) {
             return null;

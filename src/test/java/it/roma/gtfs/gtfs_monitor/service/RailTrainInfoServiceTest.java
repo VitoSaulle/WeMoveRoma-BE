@@ -17,6 +17,7 @@ import reactor.core.publisher.Mono;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Optional;
 import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -108,5 +109,36 @@ class RailTrainInfoServiceTest {
 
         // 22:45Z del 14 luglio e' 00:45 del 15 a Roma.
         assertThat(RailTrainInfoService.matchesReferenceTime(treno, OffsetDateTime.parse("2026-07-14T22:45:00Z"))).isTrue();
+    }
+
+    @Test
+    @DisplayName("un candidato che risponde con un errore non butta via gli altri")
+    void candidatoInErrore() {
+        risposte = path -> {
+            if (path.contains("cercaNumeroTrenoTrenoAutocomplete")) {
+                return testo("""
+                        2135 - ORTE|2135-S08000-1784066400000
+                        2135 - ROMA TERMINI|2135-S08409-1784066400000
+                        """);
+            }
+            if (path.contains("andamentoTreno/S08000")) {
+                return ClientResponse.create(HttpStatus.INTERNAL_SERVER_ERROR).build();
+            }
+            if (path.contains("andamentoTreno/S08409")) {
+                return ClientResponse.create(HttpStatus.OK)
+                        .header(HttpHeaders.CONTENT_TYPE, MediaType.APPLICATION_JSON_VALUE)
+                        .body("""
+                                {"numeroTreno":2135,"compNumeroTreno":"REG 2135","ritardo":3,
+                                 "fermate":[{"stazione":"ROMA TERMINI"},{"stazione":"VITERBO"}]}""")
+                        .build();
+            }
+            return testo("");
+        };
+
+        Optional<RailTrainInfoDTO> info = servizio.lookupTrainInfo("2135", null, null);
+
+        assertThat(info).isPresent();
+        assertThat(info.get().source()).isEqualTo("viaggiatreno-api");
+        assertThat(info.get().departure().stationName()).isEqualTo("ROMA TERMINI");
     }
 }
