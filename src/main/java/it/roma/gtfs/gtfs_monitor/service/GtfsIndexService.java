@@ -650,8 +650,14 @@ public class GtfsIndexService {
         // restituisce qualcosa solo se e' ancora in viaggio, quindi non ruba il
         // posto alla corsa di oggi.
         LocalDate oggi = ZonedDateTime.ofInstant(now, ROME_ZONE).toLocalDate();
-        for (LocalDate data : List.of(oggi.minusDays(1), oggi, oggi.plusDays(1))) {
-            List<ScheduledTripStop> prossime = scheduledNextStopsForTripOnDate(trip, data, now.getEpochSecond(), limit);
+        List<LocalDate> date = activeDatesForTrip(trip, List.of(oggi.minusDays(1), oggi, oggi.plusDays(1)));
+        if (date.isEmpty()) {
+            return List.of();
+        }
+        // Le righe della corsa sono le stesse per ogni data: si leggono una volta.
+        List<StopTimeRow> rows = stopTimeRowsForTrip(trip);
+        for (LocalDate data : date) {
+            List<ScheduledTripStop> prossime = scheduledNextStopsForTripOnDate(trip, rows, data, now.getEpochSecond(), limit);
             if (!prossime.isEmpty()) {
                 return prossime;
             }
@@ -775,10 +781,17 @@ public class GtfsIndexService {
         // notturna ancora in viaggio (orari 24:xx del giorno di servizio di ieri)
         // risultava "non programmata", e la mappa del bus seguito mostrava il
         // percorso senza fermate. A parita' di distanza vince la corsa successiva.
+        List<LocalDate> date = activeDatesForTrip(trip, List.of(oggi.minusDays(1), oggi, oggi.plusDays(1)));
+        if (date.isEmpty()) {
+            return List.of();
+        }
+        // Le righe di stop_times sono le stesse per tutte e tre le date: cambia solo
+        // l'ancora del giorno. Prima si rileggevano per ogni data attiva.
+        List<StopTimeRow> rows = stopTimeRowsForTrip(trip);
         List<ScheduledTripStop> migliore = List.of();
         long distanzaMigliore = Long.MAX_VALUE;
-        for (LocalDate data : List.of(oggi.minusDays(1), oggi, oggi.plusDays(1))) {
-            List<ScheduledTripStop> stops = scheduledStopsForTripOnDate(trip, data);
+        for (LocalDate data : date) {
+            List<ScheduledTripStop> stops = scheduledStopsForTripOnDate(trip, rows, data);
             if (stops.isEmpty()) {
                 continue;
             }
@@ -1497,25 +1510,38 @@ public class GtfsIndexService {
         ));
     }
 
-    private List<ScheduledTripStop> scheduledNextStopsForTripOnDate(Trip trip, LocalDate serviceDate, long nowEpochSeconds, int limit) {
+    /**
+     * Fra le date indicate, quelle in cui il servizio della corsa e' attivo. Serve a
+     * sapere se vale la pena leggere le sue righe di stop_times, e a leggerle una
+     * volta sola per tutte le date invece che una per data.
+     */
+    private List<LocalDate> activeDatesForTrip(Trip trip, List<LocalDate> dates) {
         Indexes indexes = ref.get();
-        if (!activeServiceIdsOn(serviceDate, indexes).contains(trip.serviceId())) {
-            return List.of();
+        List<LocalDate> out = new ArrayList<>(dates.size());
+        for (LocalDate date : dates) {
+            if (activeServiceIdsOn(date, indexes).contains(trip.serviceId())) {
+                out.add(date);
+            }
         }
+        return out;
+    }
 
+    /** Righe di stop_times della corsa; vuoto se il file manca o non si legge. */
+    private List<StopTimeRow> stopTimeRowsForTrip(Trip trip) {
         Path stopTimesPath = dataDir.resolve("stop_times.txt");
         if (!Files.exists(stopTimesPath)) {
             return List.of();
         }
-
-        List<StopTimeRow> rows;
         try {
-            rows = stopTimeRowsForTrip(trip.tripId(), stopTimesPath);
+            return stopTimeRowsForTrip(trip.tripId(), stopTimesPath);
         } catch (IOException e) {
             log.error("[GTFS-Index] Errore leggendo stop_times per trip {}: {}", trip.tripId(), e.toString());
             return List.of();
         }
+    }
 
+    private List<ScheduledTripStop> scheduledNextStopsForTripOnDate(
+            Trip trip, List<StopTimeRow> rows, LocalDate serviceDate, long nowEpochSeconds, int limit) {
         long serviceStartEpochSeconds = serviceDayAnchorEpochSeconds(serviceDate);
         List<ScheduledTripStop> out = new ArrayList<>(Math.min(limit, rows.size()));
         for (StopTimeRow row : rows) {
@@ -1533,25 +1559,7 @@ public class GtfsIndexService {
         return List.copyOf(out);
     }
 
-    private List<ScheduledTripStop> scheduledStopsForTripOnDate(Trip trip, LocalDate serviceDate) {
-        Indexes indexes = ref.get();
-        if (!activeServiceIdsOn(serviceDate, indexes).contains(trip.serviceId())) {
-            return List.of();
-        }
-
-        Path stopTimesPath = dataDir.resolve("stop_times.txt");
-        if (!Files.exists(stopTimesPath)) {
-            return List.of();
-        }
-
-        List<StopTimeRow> rows;
-        try {
-            rows = stopTimeRowsForTrip(trip.tripId(), stopTimesPath);
-        } catch (IOException e) {
-            log.error("[GTFS-Index] Errore leggendo stop_times completi per trip {}: {}", trip.tripId(), e.toString());
-            return List.of();
-        }
-
+    private List<ScheduledTripStop> scheduledStopsForTripOnDate(Trip trip, List<StopTimeRow> rows, LocalDate serviceDate) {
         long serviceStartEpochSeconds = serviceDayAnchorEpochSeconds(serviceDate);
         List<ScheduledTripStop> out = new ArrayList<>(rows.size());
         for (StopTimeRow row : rows) {
