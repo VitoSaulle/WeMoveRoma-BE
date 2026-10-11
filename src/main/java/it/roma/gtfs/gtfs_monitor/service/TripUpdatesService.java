@@ -12,6 +12,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 import java.time.ZonedDateTime;
@@ -26,6 +27,13 @@ public class TripUpdatesService {
     private static final long DEFAULT_REFRESH_MILLIS = 5_000L;
     private static final int MAX_LIMIT = 5_000;
     private static final long RETRY_BACKOFF_MILLIS = 400L;
+
+    /**
+     * Tetto all'attesa di un poll. Il client HTTP ha timeout di 30 s, troppi per
+     * un feed che si rilegge ogni 5: un upstream lento non deve tenere fermo il
+     * thread dello scheduler (e prima ancora le richieste HTTP) per mezzo minuto.
+     */
+    private static final Duration FEED_BLOCK_TIMEOUT = Duration.ofSeconds(10);
 
     private final GtfsProperties props;
     private final WebClient webClient;
@@ -193,7 +201,7 @@ public class TripUpdatesService {
         byte[] body = webClient.get().uri(url)
                 .retrieve()
                 .bodyToMono(byte[].class)
-                .block();
+                .block(FEED_BLOCK_TIMEOUT);
 
         if (body == null || body.length == 0) {
             log.warn("[TripUpdates] body vuoto da {}", url);

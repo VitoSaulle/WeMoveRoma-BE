@@ -14,6 +14,7 @@ import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
 
 import java.io.ByteArrayInputStream;
+import java.time.Duration;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -47,6 +48,8 @@ public class StrikeService {
             "DALLE\\s+(\\d{1,2}[\\.,:]?\\d{0,2})\\s+ALLE\\s+(\\d{1,2}[\\.,:]?\\d{0,2})",
             Pattern.CASE_INSENSITIVE);
     private static final Pattern GUID_ID = Pattern.compile(".*?/(\\d+)\\s*$");
+    /** Tetto all'attesa del feed MIT: un registro lento non tiene fermo lo scheduler. */
+    private static final Duration RSS_BLOCK_TIMEOUT = Duration.ofSeconds(30);
 
     private final WebClient webClient;
     private final FcmDispatcherService fcmDispatcher;
@@ -100,7 +103,7 @@ public class StrikeService {
                     .header("User-Agent", "wemoveroma-bot/1.0")
                     .retrieve()
                     .bodyToMono(byte[].class)
-                    .block();
+                    .block(RSS_BLOCK_TIMEOUT);
             if (body == null || body.length == 0) {
                 log.warn("[Strikes] body vuoto da {}", rssUrl);
                 return lastSnapshot.get();

@@ -13,6 +13,7 @@ import org.springframework.web.reactive.function.client.WebClient;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -23,6 +24,13 @@ import java.util.concurrent.atomic.AtomicReference;
 public class ServiceAlertsService {
     private static final long DEFAULT_REFRESH_MILLIS = 5_000L;
     private static final int MAX_LIMIT = 5_000;
+
+    /**
+     * Tetto all'attesa di un poll. Il client HTTP ha timeout di 30 s, troppi per
+     * un feed che si rilegge ogni 5: un upstream lento non deve tenere fermo il
+     * thread dello scheduler (e prima ancora le richieste HTTP) per mezzo minuto.
+     */
+    private static final Duration FEED_BLOCK_TIMEOUT = Duration.ofSeconds(10);
     private final GtfsProperties props;
     private final WebClient webClient;
     private final FcmDispatcherService fcmDispatcher;
@@ -365,7 +373,7 @@ public class ServiceAlertsService {
         byte[] body = webClient.get().uri(url)
                 .retrieve()
                 .bodyToMono(byte[].class)
-                .block();
+                .block(FEED_BLOCK_TIMEOUT);
 
         if (body == null || body.length == 0) {
             log.warn("[ServiceAlerts] body vuoto da {}", url);

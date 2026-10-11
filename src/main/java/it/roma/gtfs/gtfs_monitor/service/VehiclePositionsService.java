@@ -16,6 +16,7 @@ import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.text.Normalizer;
+import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -28,6 +29,13 @@ public class VehiclePositionsService {
     /** Pausa fra un tentativo e l'altro, come in TripUpdatesService. */
     private static final long RETRY_BACKOFF_MILLIS = 400L;
     private static final int MAX_LIMIT = 5_000;
+
+    /**
+     * Tetto all'attesa di un poll. Il client HTTP ha timeout di 30 s, troppi per
+     * un feed che si rilegge ogni 5: un upstream lento non deve tenere fermo il
+     * thread dello scheduler (e prima ancora le richieste HTTP) per mezzo minuto.
+     */
+    private static final Duration FEED_BLOCK_TIMEOUT = Duration.ofSeconds(10);
 
     private static final ZoneId ROME = ZoneId.of("Europe/Rome");
     private static final DateTimeFormatter ISO_ROME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss XXX").withZone(ROME);
@@ -193,7 +201,7 @@ public class VehiclePositionsService {
                 .uri(url)
                 .retrieve()
                 .bodyToMono(byte[].class)
-                .block();
+                .block(FEED_BLOCK_TIMEOUT);
 
         if (body == null || body.length == 0) {
             log.warn("[VehiclePositions] body vuoto da {}", url);
