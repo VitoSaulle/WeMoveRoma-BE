@@ -326,7 +326,9 @@ public class JourneyPlannerService {
     }
 
     private String buildModesClause(String requestedModes) {
-        LinkedHashSet<String> normalizedModes = Arrays.stream(firstNonBlank(requestedModes, "").split(","))
+        // Niente firstNonBlank(requestedModes, ""): "" e' blank, tornerebbe null.
+        String raw = requestedModes == null ? "" : requestedModes;
+        LinkedHashSet<String> normalizedModes = Arrays.stream(raw.split(","))
                 .map(String::trim)
                 .filter(value -> !value.isEmpty())
                 .map(value -> value.toUpperCase(Locale.ROOT))
