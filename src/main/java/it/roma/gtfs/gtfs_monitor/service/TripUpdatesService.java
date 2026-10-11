@@ -51,28 +51,31 @@ public class TripUpdatesService {
     private final GtfsProperties props;
     private final WebClient webClient;
     private final GtfsIndexService indexService;
-    private final AtomicReference<CacheEntry<List<TripUpdateDTO>>> cacheRef = new AtomicReference<>(CacheEntry.empty());
+    private final AtomicReference<CacheEntry> cacheRef = new AtomicReference<>(CacheEntry.empty());
     private final Object refreshLock = new Object();
     private static final DateTimeFormatter ROME_TS = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss z");
 
+    /**
+     * Le righe dello snapshot, eventualmente di una linea sola. La lista
+     * restituita e' immutabile: senza filtri e' lo snapshot stesso, senza copie.
+     */
     public List<TripUpdateDTO> fetch(String linea, Integer limit) {
-        List<TripUpdateDTO> base = getCachedOrRefresh();
-        if (base.isEmpty()) {
-            return List.of();
-        }
-
+        CacheEntry current = getCachedOrRefresh();
+        List<TripUpdateDTO> base = linea == null
+                ? current.dataOrEmpty()
+                : current.indici().perLinea().getOrDefault(linea, List.of());
         int max = normalizeLimit(limit);
-        List<TripUpdateDTO> out = new ArrayList<>(max > 0 ? Math.min(max, base.size()) : base.size());
-        for (TripUpdateDTO dto : base) {
-            if (linea != null && !Objects.equals(dto.getLinea(), linea)) {
-                continue;
-            }
-            out.add(dto);
-            if (max > 0 && out.size() >= max) {
-                break;
-            }
-        }
-        return out;
+        return max > 0 && base.size() > max ? base.subList(0, max) : base;
+    }
+
+    /**
+     * Le righe di una fermata, dall'indice costruito una volta per snapshot.
+     * Prima chi cercava gli arrivi di una fermata copiava e raggruppava a ogni
+     * richiesta l'intero feed (decine di migliaia di righe).
+     */
+    public List<TripUpdateDTO> updatesForStop(String stopId) {
+        if (stopId == null || stopId.isBlank()) return List.of();
+        return getCachedOrRefresh().indici().perFermata().getOrDefault(stopId, List.of());
     }
 
     public long countDelayedVehicles(String linea) {
@@ -99,14 +102,13 @@ public class TripUpdatesService {
         long now = System.currentTimeMillis();
         int max = normalizeLimit(limit);
 
-        List<TripUpdateDTO> base = getCachedOrRefresh();
+        List<TripUpdateDTO> base = getCachedOrRefresh().indici().perVeicolo().getOrDefault(target, List.of());
         if (base.isEmpty()) return List.of();
 
         List<TripUpdateDTO> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
 
         for (TripUpdateDTO dto : base) {
-            if (!target.equals(dto.getVeicolo())) continue;
             Long bestTimeMs = bestTimeMillis(dto);
             if (bestTimeMs != null && bestTimeMs < (now - 5 * 60_000L)) continue;
 
@@ -150,19 +152,18 @@ public class TripUpdatesService {
      * bloccante in fila dietro il lock. La richiesta scarica solo a freddo,
      * e al massimo una volta per intervallo.
      */
-    private List<TripUpdateDTO> getCachedOrRefresh() {
-        CacheEntry<List<TripUpdateDTO>> current = cacheRef.get();
+    private CacheEntry getCachedOrRefresh() {
+        CacheEntry current = cacheRef.get();
         if (!current.isEmpty()) {
-            return current.data();
+            return current;
         }
         refreshCache(false);
-        List<TripUpdateDTO> data = cacheRef.get().data();
-        return data != null ? data : List.of();
+        return cacheRef.get();
     }
 
     private void refreshCache(boolean force) {
         synchronized (refreshLock) {
-            CacheEntry<List<TripUpdateDTO>> current = cacheRef.get();
+            CacheEntry current = cacheRef.get();
             if (!force && !isExpired(current)) {
                 return;
             }
@@ -182,7 +183,8 @@ public class TripUpdatesService {
             List<TripUpdateDTO> fresh = fetched.get();
             boolean emptyForLong = now - current.loadedAtMillis() > EMPTY_FEED_GRACE_MILLIS;
             if (!fresh.isEmpty() || current.isEmpty() || emptyForLong) {
-                cacheRef.set(new CacheEntry<>(List.copyOf(fresh), now, now));
+                List<TripUpdateDTO> immutable = List.copyOf(fresh);
+                cacheRef.set(new CacheEntry(immutable, Indici.di(immutable), now, now));
             } else {
                 cacheRef.set(current.withAttempt(now));
             }
@@ -299,7 +301,7 @@ public class TripUpdatesService {
     }
 
     /** Scaduta = l'ultimo tentativo, riuscito o no, e' piu' vecchio di un intervallo. */
-    private boolean isExpired(CacheEntry<?> entry) {
+    private boolean isExpired(CacheEntry entry) {
         return (System.currentTimeMillis() - entry.attemptedAtMillis()) > refreshMillis();
     }
 
@@ -337,20 +339,57 @@ public class TripUpdatesService {
     }
 
     /**
+     * @param indici            le stesse righe raggruppate, costruite una volta per snapshot
      * @param loadedAtMillis    quando sono arrivati i dati serviti
      * @param attemptedAtMillis ultimo tentativo di download, anche fallito
      */
-    private record CacheEntry<T>(T data, long loadedAtMillis, long attemptedAtMillis) {
-        private static <T> CacheEntry<T> empty() {
-            return new CacheEntry<>(null, 0L, 0L);
+    private record CacheEntry(List<TripUpdateDTO> data, Indici indici, long loadedAtMillis, long attemptedAtMillis) {
+        private static CacheEntry empty() {
+            return new CacheEntry(null, Indici.VUOTI, 0L, 0L);
         }
 
-        private CacheEntry<T> withAttempt(long attemptedAt) {
-            return new CacheEntry<>(data, loadedAtMillis, attemptedAt);
+        private CacheEntry withAttempt(long attemptedAt) {
+            return new CacheEntry(data, indici, loadedAtMillis, attemptedAt);
+        }
+
+        private List<TripUpdateDTO> dataOrEmpty() {
+            return data != null ? data : List.of();
         }
 
         private boolean isEmpty() {
             return data == null;
+        }
+    }
+
+    /** Lo snapshot raggruppato per fermata, veicolo e linea. Mappe e liste immutabili. */
+    private record Indici(
+            Map<String, List<TripUpdateDTO>> perFermata,
+            Map<String, List<TripUpdateDTO>> perVeicolo,
+            Map<String, List<TripUpdateDTO>> perLinea
+    ) {
+        private static final Indici VUOTI = new Indici(Map.of(), Map.of(), Map.of());
+
+        private static Indici di(List<TripUpdateDTO> righe) {
+            Map<String, List<TripUpdateDTO>> perFermata = new HashMap<>();
+            Map<String, List<TripUpdateDTO>> perVeicolo = new HashMap<>();
+            Map<String, List<TripUpdateDTO>> perLinea = new HashMap<>();
+            for (TripUpdateDTO dto : righe) {
+                aggiungi(perFermata, dto.getFermataId(), dto);
+                aggiungi(perVeicolo, dto.getVeicolo(), dto);
+                aggiungi(perLinea, dto.getLinea(), dto);
+            }
+            return new Indici(immutabile(perFermata), immutabile(perVeicolo), immutabile(perLinea));
+        }
+
+        private static void aggiungi(Map<String, List<TripUpdateDTO>> mappa, String chiave, TripUpdateDTO dto) {
+            if (chiave == null || chiave.isBlank()) return;
+            mappa.computeIfAbsent(chiave, k -> new ArrayList<>()).add(dto);
+        }
+
+        private static Map<String, List<TripUpdateDTO>> immutabile(Map<String, List<TripUpdateDTO>> mappa) {
+            Map<String, List<TripUpdateDTO>> out = new HashMap<>(mappa.size() * 2);
+            mappa.forEach((k, v) -> out.put(k, List.copyOf(v)));
+            return Map.copyOf(out);
         }
     }
 }

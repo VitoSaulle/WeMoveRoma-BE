@@ -57,8 +57,7 @@ public class VehiclePositionsService {
     private final WebClient webClient;
     private final GtfsIndexService indexService;
     private final VehiclePositionsSseService vehiclePositionsSseService;
-    private final AtomicReference<CacheEntry<List<VehiclePositionDTO>>> cacheRef =
-            new AtomicReference<>(CacheEntry.empty());
+    private final AtomicReference<CacheEntry> cacheRef = new AtomicReference<>(CacheEntry.empty());
     private final Object refreshLock = new Object();
 
 
@@ -71,9 +70,14 @@ public class VehiclePositionsService {
     }
 
     public List<VehiclePositionDTO> fetch(String linea, String capolinea, Integer limit) {
-        List<VehiclePositionDTO> base = getCachedOrRefresh();
+        List<VehiclePositionDTO> base = getCachedOrRefresh().dataOrEmpty();
         String normalizedCapolinea = normalizeText(capolinea);
         int max = normalizeLimit(limit);
+        if (linea == null && normalizedCapolinea == null && max <= 0) {
+            // Senza filtri si restituisce lo snapshot stesso, immutabile: niente
+            // copia di migliaia di mezzi a ogni richiesta.
+            return base;
+        }
         List<VehiclePositionDTO> out = new ArrayList<>(max > 0 ? Math.min(max, base.size()) : base.size());
         for (VehiclePositionDTO dto : base) {
             if (linea != null && !indexService.matchesLine(linea, dto.getLinea())) {
@@ -98,11 +102,7 @@ public class VehiclePositionsService {
     }
 
     public Instant lastSnapshotAt() {
-        CacheEntry<List<VehiclePositionDTO>> current = cacheRef.get();
-        if (current.isEmpty()) {
-            getCachedOrRefresh();
-            current = cacheRef.get();
-        }
+        CacheEntry current = getCachedOrRefresh();
         return current.isEmpty() ? null : Instant.ofEpochMilli(current.loadedAtMillis());
     }
 
@@ -134,19 +134,34 @@ public class VehiclePositionsService {
      * l'altra. Ora la richiesta scarica solo a freddo, quando non c'e' ancora
      * niente da servire, e anche allora al massimo un tentativo per intervallo.
      */
-    private List<VehiclePositionDTO> getCachedOrRefresh() {
-        CacheEntry<List<VehiclePositionDTO>> current = cacheRef.get();
+    private CacheEntry getCachedOrRefresh() {
+        CacheEntry current = cacheRef.get();
         if (!current.isEmpty()) {
-            return current.data();
+            return current;
         }
         refreshCache(false);
-        List<VehiclePositionDTO> data = cacheRef.get().data();
-        return data != null ? data : List.of();
+        return cacheRef.get();
+    }
+
+    /**
+     * Il mezzo che sta facendo la corsa, dall'indice costruito una volta per
+     * snapshot (a parita' di corsa vince il primo del feed). Prima chi cercava
+     * gli arrivi copiava e indicizzava l'intero elenco a ogni richiesta.
+     */
+    public VehiclePositionDTO vehicleByTrip(String tripId) {
+        if (tripId == null || tripId.isBlank()) return null;
+        return getCachedOrRefresh().indici().perCorsa().get(tripId);
+    }
+
+    /** Il mezzo con questo id veicolo, dall'indice per snapshot. */
+    public VehiclePositionDTO vehicleById(String vehicleId) {
+        if (vehicleId == null || vehicleId.isBlank()) return null;
+        return getCachedOrRefresh().indici().perVeicolo().get(vehicleId);
     }
 
     private void refreshCache(boolean force) {
         synchronized (refreshLock) {
-            CacheEntry<List<VehiclePositionDTO>> current = cacheRef.get();
+            CacheEntry current = cacheRef.get();
             if (!force && !isExpired(current)) {
                 return;
             }
@@ -167,7 +182,7 @@ public class VehiclePositionsService {
             boolean emptyForLong = now - current.loadedAtMillis() > EMPTY_FEED_GRACE_MILLIS;
             if (!fresh.isEmpty() || current.isEmpty() || emptyForLong) {
                 List<VehiclePositionDTO> immutable = List.copyOf(fresh);
-                cacheRef.set(new CacheEntry<>(immutable, now, now));
+                cacheRef.set(new CacheEntry(immutable, Indici.di(immutable), now, now));
                 vehiclePositionsSseService.publish(immutable, Instant.ofEpochMilli(now));
             } else {
                 cacheRef.set(current.withAttempt(now));
@@ -299,7 +314,7 @@ public class VehiclePositionsService {
     }
 
     /** Scaduta = l'ultimo tentativo, riuscito o no, e' piu' vecchio di un intervallo. */
-    private boolean isExpired(CacheEntry<?> entry) {
+    private boolean isExpired(CacheEntry entry) {
         return (System.currentTimeMillis() - entry.attemptedAtMillis()) > refreshMillis();
     }
 
@@ -386,16 +401,21 @@ public class VehiclePositionsService {
     }
 
     /**
+     * @param indici            gli stessi mezzi per corsa e per veicolo, una volta per snapshot
      * @param loadedAtMillis    quando sono arrivati i dati serviti
      * @param attemptedAtMillis ultimo tentativo di download, anche fallito
      */
-    private record CacheEntry<T>(T data, long loadedAtMillis, long attemptedAtMillis) {
-        private static <T> CacheEntry<T> empty() {
-            return new CacheEntry<>(null, 0L, 0L);
+    private record CacheEntry(List<VehiclePositionDTO> data, Indici indici, long loadedAtMillis, long attemptedAtMillis) {
+        private static CacheEntry empty() {
+            return new CacheEntry(null, Indici.VUOTI, 0L, 0L);
         }
 
-        private CacheEntry<T> withAttempt(long attemptedAt) {
-            return new CacheEntry<>(data, loadedAtMillis, attemptedAt);
+        private CacheEntry withAttempt(long attemptedAt) {
+            return new CacheEntry(data, indici, loadedAtMillis, attemptedAt);
+        }
+
+        private List<VehiclePositionDTO> dataOrEmpty() {
+            return data != null ? data : List.of();
         }
 
         private boolean isEmpty() {
@@ -404,4 +424,19 @@ public class VehiclePositionsService {
     }
 
     private record Position(double lat, double lon) {}
+
+    /** Mezzi per corsa e per id veicolo; a parita' di chiave vince il primo del feed. */
+    private record Indici(Map<String, VehiclePositionDTO> perCorsa, Map<String, VehiclePositionDTO> perVeicolo) {
+        private static final Indici VUOTI = new Indici(Map.of(), Map.of());
+
+        private static Indici di(List<VehiclePositionDTO> mezzi) {
+            Map<String, VehiclePositionDTO> perCorsa = new HashMap<>();
+            Map<String, VehiclePositionDTO> perVeicolo = new HashMap<>();
+            for (VehiclePositionDTO v : mezzi) {
+                if (v.getCorsa() != null && !v.getCorsa().isBlank()) perCorsa.putIfAbsent(v.getCorsa(), v);
+                if (v.getVeicolo() != null && !v.getVeicolo().isBlank()) perVeicolo.putIfAbsent(v.getVeicolo(), v);
+            }
+            return new Indici(Map.copyOf(perCorsa), Map.copyOf(perVeicolo));
+        }
+    }
 }

@@ -217,22 +217,13 @@ public class NearbyService {
 
         int arrivalsLimit = limitArrivalsPerStop == null || limitArrivalsPerStop <= 0 ? 8 : Math.min(limitArrivalsPerStop, 12);
         long now = System.currentTimeMillis();
-        List<TripUpdateDTO> updates = tripUpdatesService.fetch(null, null);
-        List<VehiclePositionDTO> vehicles = vehiclePositionsService.fetch(null, null, null);
-
-        List<TripUpdateDTO> updatesForStop = updates.stream()
-                .filter(u -> stopId.equals(u.getFermataId()))
-                .toList();
-
-        Map<String, VehiclePositionDTO> vehiclesByTripId = vehicles.stream()
-                .filter(v -> v.getCorsa() != null && !v.getCorsa().isBlank())
-                .collect(Collectors.toMap(VehiclePositionDTO::getCorsa, v -> v, (a, b) -> a));
-        Map<String, VehiclePositionDTO> vehiclesById = vehicles.stream()
-                .filter(v -> v.getVeicolo() != null && !v.getVeicolo().isBlank())
-                .collect(Collectors.toMap(VehiclePositionDTO::getVeicolo, v -> v, (a, b) -> a));
+        // Gli indici per fermata, corsa e veicolo li costruiscono i servizi una
+        // volta per snapshot: prima qui si copiava e si scorreva l'intero feed
+        // (arrivi e mezzi) a ogni richiesta.
+        List<TripUpdateDTO> updatesForStop = tripUpdatesService.updatesForStop(stopId);
 
         String richiesta = linea == null || linea.isBlank() ? null : linea.trim();
-        return toNearbyStop(new StopDistance(stop, 0), updatesForStop, vehiclesByTripId, vehiclesById, arrivalsLimit, now, false, richiesta);
+        return toNearbyStop(new StopDistance(stop, 0), updatesForStop, arrivalsLimit, now, false, richiesta);
     }
 
     public NearbyResponseDTO nearby(double lat, double lon, Integer radiusMeters, Integer limitStops, Integer limitArrivalsPerStop) {
@@ -241,19 +232,6 @@ public class NearbyService {
         int arrivalsLimit = limitArrivalsPerStop == null || limitArrivalsPerStop <= 0 ? 6 : Math.min(limitArrivalsPerStop, 12);
 
         long now = System.currentTimeMillis();
-        List<TripUpdateDTO> updates = tripUpdatesService.fetch(null, null);
-        List<VehiclePositionDTO> vehicles = vehiclePositionsService.fetch(null, null, null);
-
-        Map<String, List<TripUpdateDTO>> updatesByStop = updates.stream()
-                .filter(u -> u.getFermataId() != null && !u.getFermataId().isBlank())
-                .collect(Collectors.groupingBy(TripUpdateDTO::getFermataId));
-
-        Map<String, VehiclePositionDTO> vehiclesByTripId = vehicles.stream()
-                .filter(v -> v.getCorsa() != null && !v.getCorsa().isBlank())
-                .collect(Collectors.toMap(VehiclePositionDTO::getCorsa, v -> v, (a, b) -> a));
-        Map<String, VehiclePositionDTO> vehiclesById = vehicles.stream()
-                .filter(v -> v.getVeicolo() != null && !v.getVeicolo().isBlank())
-                .collect(Collectors.toMap(VehiclePositionDTO::getVeicolo, v -> v, (a, b) -> a));
 
         List<NearbyStopDTO> stops = gtfsIndexService.allStops().stream()
                 .filter(s -> s.lat() != null && s.lon() != null)
@@ -261,7 +239,7 @@ public class NearbyService {
                 .filter(sd -> sd.distanceMeters <= radius)
                 .sorted(Comparator.comparingInt(sd -> sd.distanceMeters))
                 .limit(stopsLimit)
-                .map(sd -> toNearbyStop(sd, updatesByStop.getOrDefault(sd.stop.id(), List.of()), vehiclesByTripId, vehiclesById, arrivalsLimit, now, true))
+                .map(sd -> toNearbyStop(sd, tripUpdatesService.updatesForStop(sd.stop.id()), arrivalsLimit, now, true))
                 .toList();
 
         return new NearbyResponseDTO(lat, lon, radius, stops, Instant.now());
@@ -270,27 +248,23 @@ public class NearbyService {
     private NearbyStopDTO toNearbyStop(
             StopDistance sd,
             List<TripUpdateDTO> updates,
-            Map<String, VehiclePositionDTO> vehiclesByTripId,
-            Map<String, VehiclePositionDTO> vehiclesById,
             int arrivalsLimit,
             long now,
             boolean includeDistance
     ) {
-        return toNearbyStop(sd, updates, vehiclesByTripId, vehiclesById, arrivalsLimit, now, includeDistance, null);
+        return toNearbyStop(sd, updates, arrivalsLimit, now, includeDistance, null);
     }
 
     private NearbyStopDTO toNearbyStop(
             StopDistance sd,
             List<TripUpdateDTO> updates,
-            Map<String, VehiclePositionDTO> vehiclesByTripId,
-            Map<String, VehiclePositionDTO> vehiclesById,
             int arrivalsLimit,
             long now,
             boolean includeDistance,
             String linea
     ) {
         List<NearbyArrivalDTO> liveArrivals = updates.stream()
-                .map(u -> toArrival(u, vehiclesByTripId, vehiclesById, now))
+                .map(u -> toArrival(u, now))
                 .filter(Objects::nonNull)
                 .toList();
         List<NearbyArrivalDTO> scheduledArrivals = gtfsIndexService
@@ -422,12 +396,7 @@ public class NearbyService {
                 .toList();
     }
 
-    private NearbyArrivalDTO toArrival(
-            TripUpdateDTO dto,
-            Map<String, VehiclePositionDTO> vehiclesByTripId,
-            Map<String, VehiclePositionDTO> vehiclesById,
-            long now
-    ) {
+    private NearbyArrivalDTO toArrival(TripUpdateDTO dto, long now) {
         Long etaMs = bestTimeMillis(dto);
         if (etaMs == null) {
             return null;
@@ -439,7 +408,7 @@ public class NearbyService {
 
         GtfsIndexService.Trip trip = gtfsIndexService.tripByIdOrNull(dto.getCorsa());
         String destination = trip != null ? trip.headsign() : null;
-        VehiclePositionDTO vehicle = findVehicle(dto, vehiclesByTripId, vehiclesById);
+        VehiclePositionDTO vehicle = findVehicle(dto);
         Boolean wheelchairAccessible = vehicle != null
                 ? vehicle.getWheelchairAccessible()
                 : wheelchairAccessible(trip);
@@ -459,19 +428,10 @@ public class NearbyService {
         );
     }
 
-    private static VehiclePositionDTO findVehicle(
-            TripUpdateDTO dto,
-            Map<String, VehiclePositionDTO> vehiclesByTripId,
-            Map<String, VehiclePositionDTO> vehiclesById
-    ) {
-        if (dto.getCorsa() != null && !dto.getCorsa().isBlank()) {
-            VehiclePositionDTO byTrip = vehiclesByTripId.get(dto.getCorsa());
-            if (byTrip != null) return byTrip;
-        }
-        if (dto.getVeicolo() != null && !dto.getVeicolo().isBlank()) {
-            return vehiclesById.get(dto.getVeicolo());
-        }
-        return null;
+    private VehiclePositionDTO findVehicle(TripUpdateDTO dto) {
+        VehiclePositionDTO byTrip = vehiclePositionsService.vehicleByTrip(dto.getCorsa());
+        if (byTrip != null) return byTrip;
+        return vehiclePositionsService.vehicleById(dto.getVeicolo());
     }
 
     private static Boolean wheelchairAccessible(GtfsIndexService.Trip trip) {
