@@ -25,6 +25,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.LocalDate;
@@ -207,7 +208,7 @@ public class GtfsIndexService {
     }
 
     private void warmUpPerDateIndexes(long generation) {
-        LocalDate today = LocalDate.now(ROME_ZONE);
+        LocalDate today = today();
         long t0 = System.nanoTime();
         for (int offset = 0; offset < warmupDays; offset++) {
             if (generation != rebuildGeneration.get()) {
@@ -215,6 +216,11 @@ public class GtfsIndexService {
                 return;
             }
             LocalDate date = today.plusDays(offset);
+            if (!inCacheWindow(date, today)) {
+                // La cache tiene al massimo fino a domani: scaldare oltre sarebbe
+                // una scansione buttata via.
+                break;
+            }
             try {
                 perDateIndexes(date);
             } catch (RuntimeException e) {
@@ -353,8 +359,7 @@ public class GtfsIndexService {
      * Le corse si prendono dall'indice del giorno indicato, e poi da quelli di
      * altri giorni gia' in cache, senza costruirne: una linea solo feriale la
      * domenica non c'e', ma l'indice di sabato o di lunedi' di solito si'. Chiedere
-     * una data nuova costerebbe una scansione di stop_times e spingerebbe fuori
-     * dalla cache l'indice di un altro giorno.
+     * una data nuova costerebbe una scansione di stop_times.
      *
      * Vuoto se nessuna corsa passa da entrambe o il tracciato e' troppo lontano
      * dalle fermate: la linea dritta, se serve, la decide chi chiama.
@@ -555,12 +560,10 @@ public class GtfsIndexService {
      * <p>Di notte si guarda anche il giorno di servizio di ieri: dopo mezzanotte
      * le corse ancora in viaggio gli appartengono (orari 24:xx, 25:xx).
      *
-     * <p>Mai tre date insieme. La cache degli indici per-data tiene solo le due
-     * date accanto a quella appena costruita: chiedere ieri, oggi e domani nella
-     * stessa chiamata butta fuori ogni volta un indice e lo ricostruisce, tre
-     * secondi l'uno, a ogni poll di ogni client. Quindi: di notte ieri e oggi,
-     * di giorno solo oggi, e domani soltanto nell'ultima ora, quando una corsa
-     * "vicina a partire" puo' essere la prima del giorno dopo.
+     * <p>Solo le date che servono: di notte ieri e oggi, di giorno solo oggi, e
+     * domani soltanto nell'ultima ora, quando una corsa "vicina a partire" puo'
+     * essere la prima del giorno dopo. La cache per-data tiene ieri, oggi e
+     * domani, ma ogni data in piu' da scorrere e' lavoro a ogni poll.
      *
      * <p>Se nessuna e' in viaggio resta la piu' vicina a partire, come prima: la
      * mappa di una linea rada non deve svuotarsi fra una corsa e l'altra.
@@ -678,9 +681,9 @@ public class GtfsIndexService {
      * corsa, numero di corse e intervallo tipico fra una e l'altra.
      *
      * Una data sola e non i tre giorni-tipo (feriale, sabato, domenica): la cache
-     * degli indici per-data tiene solo il giorno richiesto e i due adiacenti, e
-     * chiederne tre lontani fra loro la farebbe ricostruire a ogni richiesta,
-     * un secondo e mezzo e decine di MB per volta.
+     * degli indici per-data tiene solo ieri, oggi e domani, e ogni data fuori da
+     * quella finestra si costruisce da capo a ogni richiesta, un secondo e mezzo
+     * e decine di MB per volta.
      */
     public List<LinePattern> linePatterns(String line, LocalDate serviceDate) {
         if (line == null || line.isBlank()) {
@@ -1231,22 +1234,50 @@ public class GtfsIndexService {
             }
 
             PerDateIndexes built = buildPerDateIndexes(serviceDate);
-            scheduledByDateRef.set(withDate(scheduledByDateRef.get(), serviceDate, built.scheduled()));
-            activeTripsByDateRef.set(withDate(activeTripsByDateRef.get(), serviceDate, built.activeTrips()));
+            LocalDate today = today();
+            if (!inCacheWindow(serviceDate, today)) {
+                // Fuori da ieri-oggi-domani l'indice serve a questa richiesta e
+                // basta: metterlo in cache spingerebbe fuori uno dei tre giorni che
+                // arrivi e mezzi simulati chiedono a ogni poll.
+                return built;
+            }
+            scheduledByDateRef.set(withDate(scheduledByDateRef.get(), serviceDate, built.scheduled(), today));
+            activeTripsByDateRef.set(withDate(activeTripsByDateRef.get(), serviceDate, built.activeTrips(), today));
             return built;
         }
     }
 
     /**
-     * Inserisce l'indice della data tenendo in cache solo il giorno prima e il giorno
-     * dopo: oltre non serve a nessuno e ogni data costa decine di MB.
+     * Orologio per il "giorno di oggi" della cache per-data. Sostituibile nei test.
      */
-    private static <V> Map<LocalDate, V> withDate(Map<LocalDate, V> current, LocalDate serviceDate, V built) {
+    private Clock clock = Clock.system(ROME_ZONE);
+
+    void setClock(Clock clock) {
+        this.clock = clock;
+    }
+
+    private LocalDate today() {
+        return LocalDate.now(clock.withZone(ROME_ZONE));
+    }
+
+    private static boolean inCacheWindow(LocalDate date, LocalDate today) {
+        return !date.isBefore(today.minusDays(1)) && !date.isAfter(today.plusDays(1));
+    }
+
+    /**
+     * Inserisce l'indice della data tenendo in cache solo ieri, oggi e domani.
+     *
+     * La finestra e' ancorata a oggi e non alla data appena inserita: prima si
+     * tenevano i due giorni accanto a quella, e chiedere ieri e poi domani (come
+     * fa simulatedTripById) li faceva espellere a vicenda, una scansione completa
+     * di stop_times a ogni chiamata. Oltre i tre giorni non serve a nessuno e ogni
+     * data costa decine di MB.
+     */
+    private static <V> Map<LocalDate, V> withDate(Map<LocalDate, V> current, LocalDate serviceDate, V built, LocalDate today) {
         Map<LocalDate, V> next = new HashMap<>();
         for (Map.Entry<LocalDate, V> entry : current.entrySet()) {
-            LocalDate date = entry.getKey();
-            if (!date.isBefore(serviceDate.minusDays(1)) && !date.isAfter(serviceDate.plusDays(1))) {
-                next.put(date, entry.getValue());
+            if (inCacheWindow(entry.getKey(), today)) {
+                next.put(entry.getKey(), entry.getValue());
             }
         }
         next.put(serviceDate, built);
