@@ -1,6 +1,8 @@
 package it.roma.gtfs.gtfs_monitor.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import it.roma.gtfs.gtfs_monitor.model.dto.RailStationPlatformDTO;
+import it.roma.gtfs.gtfs_monitor.model.dto.RailTrainInfoDTO;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -79,5 +81,32 @@ class RailTrainInfoServiceTest {
         }
 
         assertThat(servizio.cacheSize()).isLessThanOrEqualTo(RailTrainInfoService.MAX_CACHE_ENTRIES);
+    }
+
+    private static RailTrainInfoDTO treno(String partenza, String arrivo) {
+        return new RailTrainInfoDTO("test", "2135", "REG 2135", null, 0, null, null,
+                new RailStationPlatformDTO("Roma Termini", null, partenza, null, null, null, null),
+                new RailStationPlatformDTO("Viterbo", null, arrivo, null, null, null, null),
+                null, List.of());
+    }
+
+    @Test
+    @DisplayName("l'ora chiesta in UTC si confronta con gli orari di Roma: d'estate sono due ore avanti")
+    void oraInUtcDEstate() {
+        RailTrainInfoDTO treno = treno("10:00", "11:30");
+
+        // 08:15Z e' 10:15 a Roma: il treno e' in viaggio.
+        assertThat(RailTrainInfoService.matchesReferenceTime(treno, OffsetDateTime.parse("2026-07-15T08:15:00Z"))).isTrue();
+        // 10:15Z e' 12:15 a Roma: arrivato da tre quarti d'ora.
+        assertThat(RailTrainInfoService.matchesReferenceTime(treno, OffsetDateTime.parse("2026-07-15T10:15:00Z"))).isFalse();
+    }
+
+    @Test
+    @DisplayName("un'ora UTC della sera prima e' gia' il giorno dopo a Roma")
+    void cambioDiGiornoSuRoma() {
+        RailTrainInfoDTO treno = treno("00:30", "01:30");
+
+        // 22:45Z del 14 luglio e' 00:45 del 15 a Roma.
+        assertThat(RailTrainInfoService.matchesReferenceTime(treno, OffsetDateTime.parse("2026-07-14T22:45:00Z"))).isTrue();
     }
 }

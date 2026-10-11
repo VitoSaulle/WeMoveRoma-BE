@@ -892,7 +892,7 @@ public class RailTrainInfoService {
                 : referenceTime.atZoneSameInstant(ROME_ZONE).toLocalDateTime().truncatedTo(ChronoUnit.MINUTES).toString();
     }
 
-    private static boolean matchesReferenceTime(RailTrainInfoDTO info, OffsetDateTime referenceTime) {
+    static boolean matchesReferenceTime(RailTrainInfoDTO info, OffsetDateTime referenceTime) {
         if (info == null || referenceTime == null) {
             return true;
         }
@@ -903,13 +903,15 @@ public class RailTrainInfoService {
             return true;
         }
 
-        LocalDateTime departure = referenceTime.toLocalDate().atTime(departureTime);
-        LocalDateTime arrival = referenceTime.toLocalDate().atTime(arrivalTime);
+        // Gli orari di Viaggiatreno sono ora di Roma: l'istante del client va
+        // portato li', non letto nel suo fuso (un "Z" d'estate sbagliava di due ore).
+        LocalDateTime reference = referenceTime.atZoneSameInstant(ROME_ZONE).toLocalDateTime();
+        LocalDateTime departure = reference.toLocalDate().atTime(departureTime);
+        LocalDateTime arrival = reference.toLocalDate().atTime(arrivalTime);
         if (arrival.isBefore(departure)) {
             arrival = arrival.plusDays(1);
         }
 
-        LocalDateTime reference = referenceTime.toLocalDateTime();
         return !reference.isBefore(departure.minusMinutes(30)) && !reference.isAfter(arrival.plusMinutes(30));
     }
 
