@@ -92,6 +92,8 @@ public class PunctualityService {
     static final int CODA_MASSIMA = 60_000;
     static final int LOTTO = 5_000;
     private static final long INTERVALLO_AVVISI_MILLIS = 10 * 60 * 1000L;
+    /** Una voce sono al massimo 90 giorni per 24 ore di righe piccole: poche centinaia di KB in tutto. */
+    private static final int RIEPILOGHI_IN_MEMORIA = 200;
     private static final Pattern PARTIZIONE = Pattern.compile("passaggi_(\\d{4})_(\\d{2})");
     /**
      * Da quest'ora di Roma il giorno di servizio di ieri e' finito: non arrivano
@@ -117,6 +119,12 @@ public class PunctualityService {
     private final AtomicInteger inCoda = new AtomicInteger();
     private final AtomicLong scartati = new AtomicLong();
     private final Set<YearMonth> partizioniPronte = ConcurrentHashMap.newKeySet();
+    /**
+     * Cresce quando si salvano passaggi di un giorno prima di oggi, o se ne
+     * eliminano: invalida le righe dei giorni chiusi in memoria (righe()).
+     */
+    private final AtomicLong versioneStorico = new AtomicLong();
+    private final Map<String, RigheChiuse> righeChiuse = new ConcurrentHashMap<>();
 
     private ScheduledExecutorService scrittore;
     private volatile boolean schemaPronto;
@@ -130,6 +138,9 @@ public class PunctualityService {
 
     /** Passaggi di un giorno e di un'ora, gia' divisi per categoria. */
     record RigaOraria(LocalDate giorno, int ora, int campioni, int anticipo, int puntuale, int ritardo, int forteRitardo) {}
+
+    /** Le righe dei giorni prima di oggi di una richiesta, con la versione dello storico su cui sono lette. */
+    private record RigheChiuse(long versione, List<RigaOraria> righe) {}
 
     @PostConstruct
     void avvia() {
@@ -222,28 +233,64 @@ public class PunctualityService {
             return Optional.empty();
         }
         try {
-            List<RigaOraria> righe = jdbc.query("""
-                    SELECT giorno,
-                           extract(hour FROM osservato_il AT TIME ZONE 'Europe/Rome')::int AS ora,
-                           count(*) AS campioni,
-                           count(*) FILTER (WHERE ritardo_sec < ?) AS anticipo,
-                           count(*) FILTER (WHERE ritardo_sec >= ? AND ritardo_sec < ?) AS puntuale,
-                           count(*) FILTER (WHERE ritardo_sec >= ? AND ritardo_sec < ?) AS ritardo,
-                           count(*) FILTER (WHERE ritardo_sec >= ?) AS forte_ritardo
-                    FROM passaggi
-                    WHERE linea = ? AND giorno BETWEEN ? AND ?
-                    GROUP BY 1, 2
-                    """,
-                    (rs, i) -> new RigaOraria(
-                            rs.getDate("giorno").toLocalDate(), rs.getInt("ora"), rs.getInt("campioni"),
-                            rs.getInt("anticipo"), rs.getInt("puntuale"), rs.getInt("ritardo"), rs.getInt("forte_ritardo")),
-                    ANTICIPO_SOTTO_SEC, ANTICIPO_SOTTO_SEC, RITARDO_DA_SEC, RITARDO_DA_SEC, FORTE_RITARDO_DA_SEC,
-                    FORTE_RITARDO_DA_SEC, linea, Date.valueOf(dal), Date.valueOf(al));
-            return Optional.of(componi(linea, dal, al, righe, Instant.now()));
+            return Optional.of(componi(linea, dal, al, righe(linea, dal, al, oggi()), Instant.now()));
         } catch (DataAccessException e) {
             avvisa("lettura della puntualita' della linea " + linea + " fallita", e);
             return Optional.empty();
         }
+    }
+
+    /**
+     * Le righe per giorno e ora fra due date comprese. I giorni prima di oggi
+     * cambiano solo se arrivano loro passaggi in ritardo (la notte, o dopo un
+     * database spento): restano in memoria finche' non succede, e senza di
+     * loro una richiesta raggruppa fino a 90 giorni di passaggi. Oggi si legge
+     * sempre, e' un giorno solo.
+     *
+     * Non si legge puntualita_giornaliera: si aggiorna una volta al giorno, e
+     * mancano i giorni in cui il backend era spento alla manutenzione.
+     */
+    List<RigaOraria> righe(String linea, LocalDate dal, LocalDate al, LocalDate oggi) {
+        List<RigaOraria> righe = new ArrayList<>();
+        if (dal.isBefore(oggi)) {
+            LocalDate fine = al.isBefore(oggi) ? al : oggi.minusDays(1);
+            // La versione prima della lettura: una scrittura nel mezzo la rende gia' vecchia.
+            long versione = versioneStorico.get();
+            String chiave = linea + "|" + dal + "|" + fine;
+            RigheChiuse pronte = righeChiuse.get(chiave);
+            if (pronte == null || pronte.versione() != versione) {
+                pronte = new RigheChiuse(versione, List.copyOf(leggiRighe(linea, dal, fine)));
+                if (righeChiuse.size() >= RIEPILOGHI_IN_MEMORIA) {
+                    righeChiuse.clear();
+                }
+                righeChiuse.put(chiave, pronte);
+            }
+            righe.addAll(pronte.righe());
+        }
+        if (!al.isBefore(oggi)) {
+            righe.addAll(leggiRighe(linea, dal.isAfter(oggi) ? dal : oggi, al));
+        }
+        return righe;
+    }
+
+    private List<RigaOraria> leggiRighe(String linea, LocalDate dal, LocalDate al) {
+        return jdbc.query("""
+                SELECT giorno,
+                       extract(hour FROM osservato_il AT TIME ZONE 'Europe/Rome')::int AS ora,
+                       count(*) AS campioni,
+                       count(*) FILTER (WHERE ritardo_sec < ?) AS anticipo,
+                       count(*) FILTER (WHERE ritardo_sec >= ? AND ritardo_sec < ?) AS puntuale,
+                       count(*) FILTER (WHERE ritardo_sec >= ? AND ritardo_sec < ?) AS ritardo,
+                       count(*) FILTER (WHERE ritardo_sec >= ?) AS forte_ritardo
+                FROM passaggi
+                WHERE linea = ? AND giorno BETWEEN ? AND ?
+                GROUP BY 1, 2
+                """,
+                (rs, i) -> new RigaOraria(
+                        rs.getDate("giorno").toLocalDate(), rs.getInt("ora"), rs.getInt("campioni"),
+                        rs.getInt("anticipo"), rs.getInt("puntuale"), rs.getInt("ritardo"), rs.getInt("forte_ritardo")),
+                ANTICIPO_SOTTO_SEC, ANTICIPO_SOTTO_SEC, RITARDO_DA_SEC, RITARDO_DA_SEC, FORTE_RITARDO_DA_SEC,
+                FORTE_RITARDO_DA_SEC, linea, Date.valueOf(dal), Date.valueOf(al));
     }
 
     /**
@@ -397,6 +444,13 @@ public class PunctualityService {
                 coda.add(x);
             }
             throw e;
+        } finally {
+            // Dopo la scrittura (anche a meta': i lotti gia' passati restano), e con
+            // oggi preso adesso: una lettura che parte dopo vede gia' questi passaggi.
+            LocalDate oggi = oggi();
+            if (lotto.stream().anyMatch(x -> giorno(x.primaVistaCorsa()).isBefore(oggi))) {
+                versioneStorico.incrementAndGet();
+            }
         }
     }
 
@@ -491,6 +545,7 @@ public class PunctualityService {
             if (!ym.plusMonths(1).atDay(1).isAfter(limite)) {
                 jdbc.execute("DROP TABLE IF EXISTS " + nome);
                 partizioniPronte.remove(ym);
+                versioneStorico.incrementAndGet();
                 log.info("[Puntualita] eliminata la partizione {}", nome);
             }
         }
