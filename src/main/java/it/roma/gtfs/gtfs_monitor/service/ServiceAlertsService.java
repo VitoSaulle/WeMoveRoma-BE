@@ -172,7 +172,16 @@ public class ServiceAlertsService {
             initialDelayString = "${gtfs.realtime.refresh-millis:5000}"
     )
     public void scheduledRefresh() {
-        refreshCache(true);
+        // Le push partono solo da qui, a lock rilasciato: prima giravano dentro
+        // refreshLock, e se il refresh lo faceva una richiesta HTTP le chiamate
+        // a FCM le pagava quella richiesta, con le altre in fila dietro il lock.
+        refreshCache(true).ifPresent(fresh -> {
+            try {
+                dispatchNewAlertsToFcm(fresh);
+            } catch (Exception e) {
+                log.warn("[ServiceAlerts] dispatch push fallito: {}", e.toString());
+            }
+        });
     }
 
     /**
@@ -192,11 +201,12 @@ public class ServiceAlertsService {
         return data != null ? data : List.of();
     }
 
-    private void refreshCache(boolean force) {
+    /** @return lo snapshot appena accettato, vuoto se non c'e' stato download o e' fallito. */
+    private Optional<List<ServiceAlertDTO>> refreshCache(boolean force) {
         synchronized (refreshLock) {
             CacheEntry<List<ServiceAlertDTO>> current = cacheRef.get();
             if (!force && !isExpired(current)) {
-                return;
+                return Optional.empty();
             }
             long now = System.currentTimeMillis();
             Optional<List<ServiceAlertDTO>> fetched = Optional.empty();
@@ -209,19 +219,15 @@ public class ServiceAlertsService {
                 // Fallimento: si annota il tentativo, cosi' la cache conta come
                 // fresca per un altro intervallo e nessuno ritenta prima.
                 cacheRef.set(current.withAttempt(now));
-                return;
+                return Optional.empty();
             }
             // Un feed letto bene si accetta sempre, anche senza avvisi: prima uno
             // vuoto veniva scartato e gli avvisi gia' chiusi restavano serviti per
             // sempre. Il caso del singhiozzo upstream non preoccupa: chi rientra
             // nel feed e' gia' nel tracker, e non riparte una seconda push.
-            List<ServiceAlertDTO> fresh = fetched.get();
-            cacheRef.set(new CacheEntry<>(List.copyOf(fresh), now, now));
-            try {
-                dispatchNewAlertsToFcm(fresh);
-            } catch (Exception e) {
-                log.warn("[ServiceAlerts] dispatch push fallito: {}", e.toString());
-            }
+            List<ServiceAlertDTO> fresh = List.copyOf(fetched.get());
+            cacheRef.set(new CacheEntry<>(fresh, now, now));
+            return Optional.of(fresh);
         }
     }
 
