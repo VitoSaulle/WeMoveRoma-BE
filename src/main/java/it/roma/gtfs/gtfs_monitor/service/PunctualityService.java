@@ -462,8 +462,13 @@ public class PunctualityService {
         }
 
         // L'affollamento ha un passo suo: aspetta che il giorno sia finito davvero.
+        // E finito vuol dire anche salvato: dopo un database spento la coda tiene
+        // ore di passaggi, e un giorno sommato senza di loro resterebbe incompleto
+        // per sempre. Finche' in coda ce n'e' uno di quei giorni si aspetta la
+        // prossima manutenzione.
         LocalDate finito = ultimoGiornoFinito(ZonedDateTime.now(ROMA));
-        if (ultimoGiornoAffollamento == null || ultimoGiornoAffollamento.isBefore(finito)) {
+        if ((ultimoGiornoAffollamento == null || ultimoGiornoAffollamento.isBefore(finito))
+                && !inCodaFinoA(coda, finito)) {
             aggregaAffollamento(finito);
             ultimoGiornoAffollamento = finito;
         }
@@ -532,6 +537,20 @@ public class PunctualityService {
     static LocalDate ultimoGiornoFinito(ZonedDateTime adesso) {
         ZonedDateTime aRoma = adesso.withZoneSameInstant(ROMA);
         return aRoma.toLocalDate().minusDays(aRoma.getHour() >= ORA_GIORNO_FINITO ? 1 : 2);
+    }
+
+    /**
+     * Se fra i passaggi in attesa di salvataggio ce n'e' uno di un giorno fino a
+     * `finoA` compreso. Scorre tutta la coda (al massimo CODA_MASSIMA elementi,
+     * una volta l'ora): basta guardare il giorno, non quanti sono.
+     */
+    static boolean inCodaFinoA(Iterable<PunctualityCollector.Passaggio> coda, LocalDate finoA) {
+        for (PunctualityCollector.Passaggio p : coda) {
+            if (!giorno(p.primaVistaCorsa()).isAfter(finoA)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
