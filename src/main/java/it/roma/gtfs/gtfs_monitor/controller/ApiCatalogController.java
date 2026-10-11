@@ -73,6 +73,11 @@ public class ApiCatalogController {
         if (gtfsIndexService.routeIdsByPublicLine(line).isEmpty()) {
             throw new ResourceNotFoundException("Linea", line);
         }
+        // Stesso limite di /stop-schedules: una data fuori dalla cache per-data
+        // costa una scansione completa di stop_times a ogni richiesta.
+        if (date != null) {
+            verificaDataOrari(date);
+        }
 
         List<ApiLinePatternDTO.ApiLineDirectionDTO> direzioni = gtfsIndexService.linePatterns(line, date).stream()
                 .map(p -> new ApiLinePatternDTO.ApiLineDirectionDTO(
@@ -117,11 +122,7 @@ public class ApiCatalogController {
             throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
                     "Dati GTFS non ancora caricati, riprovare tra qualche istante");
         }
-        LocalDate oggi = LocalDate.now(ZoneId.of("Europe/Rome"));
-        if (date.isBefore(oggi.minusDays(1)) || date.isAfter(oggi.plusDays(14))) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
-                    "date ammesse da ieri a due settimane da oggi");
-        }
+        verificaDataOrari(date);
         List<ApiStopSchedulesDTO.Row> righe = gtfsIndexService.stopSchedules(date).stream()
                 .map(s -> new ApiStopSchedulesDTO.Row(
                         s.stopId(),
@@ -269,6 +270,19 @@ public class ApiCatalogController {
                 .toList();
         log.debug("GET /api/v1/catalog/destinations linea={} -> {}", linea, out.size());
         return out;
+    }
+
+    /**
+     * Date ammesse per gli orari: da ieri a due settimane da oggi. Ogni data nuova
+     * fa costruire un indice da decine di MB, e non e' un conto che deve poter
+     * ordinare chiunque passi.
+     */
+    private static void verificaDataOrari(LocalDate date) {
+        LocalDate oggi = LocalDate.now(ZoneId.of("Europe/Rome"));
+        if (date.isBefore(oggi.minusDays(1)) || date.isAfter(oggi.plusDays(14))) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "date ammesse da ieri a due settimane da oggi");
+        }
     }
 
     private static Comparator<String> lineComparator() {
