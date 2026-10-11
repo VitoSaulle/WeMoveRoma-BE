@@ -925,7 +925,11 @@ public class JourneyPlannerService {
         }
     }
 
-    private record TimePreference(String graphQlField, Instant when) {
+    record TimePreference(String graphQlField, Instant when) {
+        /** {@code when} e' l'ora entro cui arrivare, non quella di partenza. */
+        boolean arriveBy() {
+            return "latestArrival".equals(graphQlField);
+        }
     }
 
     // =====================================================================
@@ -955,17 +959,7 @@ public class JourneyPlannerService {
                 return null;
             }
 
-            // Scegli il primo treno che si fa davvero in tempo a prendere: deve partire dopo
-            // l'orario richiesto + il tempo di cammino fino alla stazione di salita.
-            Instant earliestCatch = preference.when().plus(Duration.ofMinutes(accessMin));
-            JourneyLegDTO rail = null;
-            for (JourneyLegDTO leg : railLegs) {
-                Instant dep = parseInstantOrNull(leg.startTime());
-                if (dep != null && !dep.isBefore(earliestCatch)) {
-                    rail = leg;
-                    break;
-                }
-            }
+            JourneyLegDTO rail = scegliTreno(railLegs, preference, accessMin, egressMin);
             if (rail == null) {
                 // Nessun treno prendibile entro la finestra dato il cammino d'accesso: non iniettare.
                 return null;
@@ -991,16 +985,7 @@ public class JourneyPlannerService {
             Integer railMin = rail.durationMinutes() != null ? rail.durationMinutes() : diffMinutes(railStart, railEnd);
             int total = accessMin + (railMin != null ? railMin : 0) + egressMin;
 
-            Instant chosenDep = parseInstantOrNull(railStart);
-            List<String> altBoardings = railLegs.stream()
-                    .map(JourneyLegDTO::startTime)
-                    .filter(t -> {
-                        Instant i = parseInstantOrNull(t);
-                        return i != null && chosenDep != null && i.isAfter(chosenDep);
-                    })
-                    .distinct()
-                    .limit(5)
-                    .toList();
+            List<String> altBoardings = altrePartenzeTreno(railLegs, rail, preference, egressMin);
 
             return new JourneyOptionDTO(
                     total,
@@ -1015,6 +1000,77 @@ public class JourneyPlannerService {
             log.debug("[JourneyPlanner] rail injection skipped: {}", e.toString());
             return null;
         }
+    }
+
+    /**
+     * Il treno da proporre fra quelli trovati da stazione a stazione.
+     * Partenza: il primo che si fa in tempo a prendere, cioe' che parte dopo
+     * l'orario richiesto + il cammino fino alla stazione di salita.
+     * Arrivo entro: {@code when} e' la scadenza, quindi l'ultimo che arriva in
+     * tempo contando anche il cammino dalla stazione di discesa a destinazione.
+     * Null se nessun treno va bene.
+     */
+    static JourneyLegDTO scegliTreno(List<JourneyLegDTO> railLegs, TimePreference preference,
+                                     int accessMin, int egressMin) {
+        if (preference.arriveBy()) {
+            JourneyLegDTO best = null;
+            Instant bestDep = null;
+            for (JourneyLegDTO leg : railLegs) {
+                Instant dep = parseInstantOrNull(leg.startTime());
+                if (dep == null || !arrivaInTempo(leg, preference.when(), egressMin)) continue;
+                if (bestDep == null || dep.isAfter(bestDep)) {
+                    best = leg;
+                    bestDep = dep;
+                }
+            }
+            return best;
+        }
+        Instant earliestCatch = preference.when().plus(Duration.ofMinutes(accessMin));
+        for (JourneyLegDTO leg : railLegs) {
+            Instant dep = parseInstantOrNull(leg.startTime());
+            if (dep != null && !dep.isBefore(earliestCatch)) {
+                return leg;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Le altre partenze da mostrare accanto al treno scelto. Partenza: i treni
+     * dopo. Arrivo entro: i treni prima che arrivano comunque in tempo (quelli
+     * dopo farebbero arrivare tardi), i piu' vicini al treno scelto.
+     */
+    static List<String> altrePartenzeTreno(List<JourneyLegDTO> railLegs, JourneyLegDTO chosen,
+                                           TimePreference preference, int egressMin) {
+        Instant chosenDep = parseInstantOrNull(chosen.startTime());
+        if (chosenDep == null) return List.of();
+        if (preference.arriveBy()) {
+            List<String> prima = railLegs.stream()
+                    .filter(leg -> arrivaInTempo(leg, preference.when(), egressMin))
+                    .map(JourneyLegDTO::startTime)
+                    .filter(t -> {
+                        Instant i = parseInstantOrNull(t);
+                        return i != null && i.isBefore(chosenDep);
+                    })
+                    .distinct()
+                    .sorted(Comparator.comparing(JourneyPlannerService::parseInstantOrNull))
+                    .toList();
+            return prima.subList(Math.max(0, prima.size() - 5), prima.size());
+        }
+        return railLegs.stream()
+                .map(JourneyLegDTO::startTime)
+                .filter(t -> {
+                    Instant i = parseInstantOrNull(t);
+                    return i != null && i.isAfter(chosenDep);
+                })
+                .distinct()
+                .limit(5)
+                .toList();
+    }
+
+    private static boolean arrivaInTempo(JourneyLegDTO leg, Instant deadline, int egressMin) {
+        Instant arr = parseInstantOrNull(leg.endTime());
+        return arr != null && !arr.plus(Duration.ofMinutes(egressMin)).isAfter(deadline);
     }
 
     @SuppressWarnings("unchecked")
