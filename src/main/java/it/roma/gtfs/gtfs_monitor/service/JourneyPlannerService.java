@@ -12,6 +12,7 @@ import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.util.UriComponentsBuilder;
+import reactor.core.publisher.Mono;
 
 import java.net.URI;
 import java.time.Duration;
@@ -25,6 +26,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.TreeSet;
 import java.util.function.Function;
@@ -939,22 +941,36 @@ public class JourneyPlannerService {
     private record RailStation(String name, double lat, double lon) {
     }
 
-    private JourneyOptionDTO tryBuildInjectedRailOption(
+    JourneyOptionDTO tryBuildInjectedRailOption(
             double fromLat, double fromLon, double toLat, double toLon, TimePreference preference) {
         try {
-            RailStation board = nearestRailStation(fromLat, fromLon);
-            RailStation alight = nearestRailStation(toLat, toLon);
-            if (board == null || alight == null) {
+            // Le chiamate a OTP vanno in due giri paralleli invece che una dopo l'altra:
+            // prima le due stazioni, poi i due cammini e i treni (dipendono solo dalle
+            // stazioni). Ogni chiamata ha il suo timeout, quindi il totale resta entro
+            // circa due timeout OTP invece di cinque.
+            Duration attesaMax = Duration.ofSeconds(Math.max(1, otpTimeoutSeconds) + 2);
+            var stazioni = Mono.zip(nearestRailStation(fromLat, fromLon), nearestRailStation(toLat, toLon))
+                    .block(attesaMax);
+            if (stazioni == null || stazioni.getT1().isEmpty() || stazioni.getT2().isEmpty()) {
                 return null;
             }
+            RailStation board = stazioni.getT1().get();
+            RailStation alight = stazioni.getT2().get();
             if (board.name().trim().equalsIgnoreCase(alight.name().trim())) {
                 return null; // stessa stazione: niente da iniettare
             }
 
-            int accessMin = walkMinutesBetween(fromLat, fromLon, board.lat(), board.lon());
-            int egressMin = walkMinutesBetween(alight.lat(), alight.lon(), toLat, toLon);
-
-            List<JourneyLegDTO> railLegs = railLegsBetween(board, alight, preference);
+            var camminiETreni = Mono.zip(
+                    walkMinutesBetween(fromLat, fromLon, board.lat(), board.lon()),
+                    walkMinutesBetween(alight.lat(), alight.lon(), toLat, toLon),
+                    railLegsBetween(board, alight, preference)
+            ).block(attesaMax);
+            if (camminiETreni == null) {
+                return null;
+            }
+            int accessMin = camminiETreni.getT1();
+            int egressMin = camminiETreni.getT2();
+            List<JourneyLegDTO> railLegs = camminiETreni.getT3();
             if (railLegs.isEmpty()) {
                 return null;
             }
@@ -1073,12 +1089,16 @@ public class JourneyPlannerService {
         return arr != null && !arr.plus(Duration.ofMinutes(egressMin)).isAfter(deadline);
     }
 
-    @SuppressWarnings("unchecked")
-    private RailStation nearestRailStation(double lat, double lon) {
+    /** La stazione ferroviaria piu' vicina nel raggio; vuoto se non c'e' o se OTP non risponde. */
+    private Mono<Optional<RailStation>> nearestRailStation(double lat, double lon) {
         String q = String.format(Locale.ROOT,
                 "{ stopsByRadius(lat: %s, lon: %s, radius: %d) { edges { node { distance stop { name lat lon vehicleMode } } } } }",
                 trimDecimals(lat), trimDecimals(lon), railInjectionMaxStationMeters);
-        Map<String, Object> payload = postGraphQl(q);
+        return postGraphQl(q).map(payload -> Optional.ofNullable(parseNearestRailStation(payload.orElse(null), lat, lon)));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static RailStation parseNearestRailStation(Map<String, Object> payload, double lat, double lon) {
         if (payload == null) return null;
         Map<String, Object> data = payload.get("data") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
         Map<String, Object> sbr = data.get("stopsByRadius") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
@@ -1109,8 +1129,8 @@ public class JourneyPlannerService {
         return best;
     }
 
-    @SuppressWarnings("unchecked")
-    private List<JourneyLegDTO> railLegsBetween(RailStation a, RailStation b, TimePreference preference) {
+    /** I treni fra le due stazioni; lista vuota se non ce ne sono o se OTP non risponde. */
+    private Mono<List<JourneyLegDTO>> railLegsBetween(RailStation a, RailStation b, TimePreference preference) {
         String q = String.format(Locale.ROOT, """
                 { planConnection(
                     origin:{location:{coordinate:{latitude:%s longitude:%s}}}
@@ -1122,7 +1142,11 @@ public class JourneyPlannerService {
                 """,
                 trimDecimals(a.lat()), trimDecimals(a.lon()), trimDecimals(b.lat()), trimDecimals(b.lon()),
                 preference.graphQlField(), preference.when().toString(), searchWindow);
-        Map<String, Object> payload = postGraphQl(q);
+        return postGraphQl(q).map(payload -> parseRailLegs(payload.orElse(null), a, b));
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<JourneyLegDTO> parseRailLegs(Map<String, Object> payload, RailStation a, RailStation b) {
         if (payload == null) return List.of();
         Map<String, Object> data = payload.get("data") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
         Map<String, Object> plan = data.get("planConnection") instanceof Map<?, ?> m ? (Map<String, Object>) m : Map.of();
@@ -1171,7 +1195,8 @@ public class JourneyPlannerService {
         return out;
     }
 
-    private int walkMinutesBetween(double lat1, double lon1, double lat2, double lon2) {
+    /** Minuti a piedi secondo OTP; se OTP non risponde, stima dalla distanza. */
+    private Mono<Integer> walkMinutesBetween(double lat1, double lon1, double lat2, double lon2) {
         String q = String.format(Locale.ROOT, """
                 { planConnection(
                     origin:{location:{coordinate:{latitude:%s longitude:%s}}}
@@ -1180,12 +1205,13 @@ public class JourneyPlannerService {
                   ){ edges{ node{ duration legs{ mode } } } } }
                 """,
                 trimDecimals(lat1), trimDecimals(lon1), trimDecimals(lat2), trimDecimals(lon2));
-        Map<String, Object> payload = postGraphQl(q);
-        Integer best = parseWalkOnlyMinutes(payload);
-        if (best != null) return best;
-        // fallback: stima da distanza in linea d'aria con fattore detour
-        double meters = haversineMeters(lat1, lon1, lat2, lon2) * 1.3;
-        return (int) Math.max(1, Math.round(meters / Math.max(0.5, walkSpeed) / 60.0));
+        return postGraphQl(q).map(payload -> {
+            Integer best = parseWalkOnlyMinutes(payload.orElse(null));
+            if (best != null) return best;
+            // fallback: stima da distanza in linea d'aria con fattore detour
+            double meters = haversineMeters(lat1, lon1, lat2, lon2) * 1.3;
+            return (int) Math.max(1, Math.round(meters / Math.max(0.5, walkSpeed) / 60.0));
+        });
     }
 
     @SuppressWarnings("unchecked")
@@ -1213,24 +1239,32 @@ public class JourneyPlannerService {
         return best;
     }
 
+    /**
+     * Una query GraphQL a OTP, senza bloccare: cosi' le chiamate indipendenti
+     * dell'iniezione treno partono insieme. Non fallisce mai: errore o timeout
+     * danno un Optional vuoto, come prima davano null.
+     */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> postGraphQl(String query) {
-        try {
-            URI uri = resolveOtpGraphQlUri();
-            Map<String, Object> request = new LinkedHashMap<>();
-            request.put("query", query);
-            return webClient.post()
-                    .uri(uri)
-                    .contentType(MediaType.APPLICATION_JSON)
-                    .header("User-Agent", "gtfs-monitor/1.0 (rail-injection)")
-                    .bodyValue(request)
-                    .retrieve()
-                    .bodyToMono(Map.class)
-                    .block(Duration.ofSeconds(Math.max(1, otpTimeoutSeconds)));
-        } catch (Exception e) {
-            log.debug("[JourneyPlanner] rail-injection GraphQL failed: {}", e.toString());
-            return null;
-        }
+    private Mono<Optional<Map<String, Object>>> postGraphQl(String query) {
+        return Mono.defer(() -> {
+                    URI uri = resolveOtpGraphQlUri();
+                    Map<String, Object> request = new LinkedHashMap<>();
+                    request.put("query", query);
+                    return webClient.post()
+                            .uri(uri)
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .header("User-Agent", "gtfs-monitor/1.0 (rail-injection)")
+                            .bodyValue(request)
+                            .retrieve()
+                            .bodyToMono(Map.class);
+                })
+                .timeout(Duration.ofSeconds(Math.max(1, otpTimeoutSeconds)))
+                .map(payload -> Optional.of((Map<String, Object>) payload))
+                .defaultIfEmpty(Optional.empty())
+                .onErrorResume(e -> {
+                    log.debug("[JourneyPlanner] rail-injection GraphQL failed: {}", e.toString());
+                    return Mono.just(Optional.empty());
+                });
     }
 
     @SuppressWarnings("unchecked")
