@@ -84,6 +84,15 @@ public class VehiclePositionsService {
         return current.isEmpty() ? null : Instant.ofEpochMilli(current.loadedAtMillis());
     }
 
+    /**
+     * L'ultima istantanea gia' in cache, senza mai scatenare un download: come
+     * {@code TripUpdatesService.snapshot()}, e per lo stesso lettore
+     * (PunctualityService, che ne prende l'affollamento dei mezzi).
+     */
+    public List<VehiclePositionDTO> snapshot() {
+        return cacheRef.get().data();
+    }
+
     @Scheduled(
             fixedDelayString = "${gtfs.realtime.refresh-millis:5000}",
             initialDelayString = "${gtfs.realtime.refresh-millis:5000}"

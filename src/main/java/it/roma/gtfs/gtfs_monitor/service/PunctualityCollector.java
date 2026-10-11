@@ -52,14 +52,23 @@ import java.util.Set;
  * purche' la corsa manchi da almeno un minuto (un feed saltato una volta non
  * chiude niente) e sia stata vista da meno di dieci.
  *
+ * L'AFFOLLAMENTO viaggia col passaggio: e' quello che il mezzo dichiarava nel
+ * feed delle posizioni mentre si avvicinava alla fermata, cioe' quanto era
+ * pieno lungo il tratto che ci arriva. Si tiene l'ultimo valore utile visto
+ * durante quell'avvicinamento: un giro in cui il mezzo manca dalle posizioni, o
+ * dice "nessun dato", non cancella quello di trenta secondi prima. Alla fermata
+ * successiva si riparte da capo. Senza dichiarazione resta null: la meta' circa
+ * dei mezzi non lo dice mai (vedi la migrazione V3).
+ *
  * Lo chiamano due thread — il campionamento e la scrittura su database — quindi
  * i metodi pubblici sono sincronizzati. Nessuna dipendenza da Spring.
  */
 public final class PunctualityCollector {
 
+    /** affollamento: codice OccupancyStatus del GTFS-Realtime, null se il mezzo non lo dichiarava. */
     public record Passaggio(
             String routeId, String corsa, String fermataId, String veicolo,
-            double ritardoMin, Instant quando, Instant primaVistaCorsa) {}
+            double ritardoMin, Instant quando, Instant primaVistaCorsa, Integer affollamento) {}
 
     /** fermateNuove: passaggi registrati dall'ultima estrazione, da sommare a quelli gia' salvati. */
     public record CorsaOsservata(
@@ -78,6 +87,8 @@ public final class PunctualityCollector {
         Double ritardoMin;
         /** Ultima previsione per fermataId: e' l'ora del passaggio che si registra. */
         Instant fermataVista;
+        /** Affollamento dichiarato mentre fermataId era la prossima fermata. */
+        Integer affollamento;
         /** Ultimo giro in cui la corsa era nel feed: decide quando chiuderla. */
         Instant vista;
         boolean primaFermata = true;
@@ -95,6 +106,16 @@ public final class PunctualityCollector {
     private final List<CorsaOsservata> chiuse = new ArrayList<>();
 
     public synchronized List<Passaggio> osserva(List<TripUpdateDTO> righe, Instant adesso) {
+        return osserva(righe, Map.of(), adesso);
+    }
+
+    /**
+     * @param affollamenti per corsa, il codice OccupancyStatus che il mezzo dichiara
+     *                     adesso nel feed delle posizioni; le corse che mancano non
+     *                     dichiarano niente
+     */
+    public synchronized List<Passaggio> osserva(List<TripUpdateDTO> righe, Map<String, Integer> affollamenti,
+                                                Instant adesso) {
         // La prima riga di ogni corsa, nell'ordine del feed, e' la prossima fermata;
         // tutte le righe insieme sono le fermate che il mezzo non ha ancora passato.
         Map<String, TripUpdateDTO> prossime = new LinkedHashMap<>();
@@ -118,10 +139,16 @@ public final class PunctualityCollector {
             if (ritardo == null) {
                 return;
             }
-            if (corsa.fermataId != null && !corsa.fermataId.equals(r.getFermataId())
+            boolean stessaFermata = r.getFermataId().equals(corsa.fermataId);
+            if (corsa.fermataId != null && !stessaFermata
                     && !rimanenti.get(id).contains(corsa.fermataId)) {
                 registra(id, corsa, out);
                 corsa.primaFermata = false;
+            }
+            Integer affollamento = affollamenti.get(id);
+            if (!stessaFermata || affollamentoUtile(affollamento)
+                    || (affollamento != null && !affollamentoUtile(corsa.affollamento))) {
+                corsa.affollamento = affollamento;
             }
             corsa.fermataId = r.getFermataId();
             corsa.ritardoMin = ritardo;
@@ -178,8 +205,16 @@ public final class PunctualityCollector {
             return;
         }
         out.add(new Passaggio(corsa.routeId, id, corsa.fermataId, corsa.veicolo, corsa.ritardoMin,
-                corsa.fermataVista, corsa.primaVista));
+                corsa.fermataVista, corsa.primaVista, corsa.affollamento));
         corsa.fermateNuove++;
+    }
+
+    /**
+     * Da 0 (vuoto) a 5 (pieno) il codice dice quanto e' pieno il mezzo. Gli altri
+     * no: 6 "non fa salire", 7 "nessun dato", 8 "non accessibile".
+     */
+    public static boolean affollamentoUtile(Integer codice) {
+        return codice != null && codice >= 0 && codice <= 5;
     }
 
     private static Double ritardo(TripUpdateDTO r) {

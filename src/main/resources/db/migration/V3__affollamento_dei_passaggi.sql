@@ -1,0 +1,17 @@
+-- Quanto era pieno il mezzo al passaggio: il valore che dichiarava nel feed
+-- delle posizioni mentre si avvicinava alla fermata, cioe' lungo il tratto che
+-- ci arriva. Lo raccoglie PunctualityCollector insieme al ritardo.
+--
+-- E' il codice OccupancyStatus del GTFS-Realtime cosi' come arriva: 0 vuoto,
+-- 1 molti posti a sedere, 2 pochi posti, 3 solo posti in piedi, 4 in piedi e
+-- stretti, 5 pieno, 6 non fa salire, 7 "nessun dato", 8 non accessibile.
+-- NULL quando il mezzo non lo dichiara. Chi legge conta come dato utile solo
+-- da 0 a 5 (PunctualityCollector.affollamentoUtile).
+--
+-- Misurato sul feed di Roma (ottobre 2026, 49 ore): compaiono solo 1 e 3, piu'
+-- qualche 6; il 48% delle rilevazioni ha un valore utile, l'11% dice 7, il 41%
+-- non dichiara niente; 132 linee su 376 non lo dichiarano mai.
+--
+-- Senza valore predefinito: per Postgres e' una modifica del solo catalogo, le
+-- partizioni gia' scritte non si toccano.
+ALTER TABLE passaggi ADD COLUMN affollamento smallint;

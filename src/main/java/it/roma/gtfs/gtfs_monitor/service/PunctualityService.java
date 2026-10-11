@@ -1,7 +1,9 @@
 package it.roma.gtfs.gtfs_monitor.service;
 
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiLinePunctualityDTO;
+import com.google.transit.realtime.GtfsRealtime;
 import it.roma.gtfs.gtfs_monitor.model.dto.TripUpdateDTO;
+import it.roma.gtfs.gtfs_monitor.model.dto.VehiclePositionDTO;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
@@ -45,9 +47,11 @@ import java.util.regex.Pattern;
  * (spring.task.scheduling.pool.size) con i poll di mezzi, arrivi e avvisi. Il
  * campionamento resta li' perche' e' solo memoria: legge l'istantanea che
  * TripUpdatesService ha gia' scaricato (mai una nuova: un download in piu'
- * raddoppierebbe i poll verso romamobilita.it, che ha un filtro anti-bot). Le
- * scritture no: con un Postgres lento o spento occuperebbero thread del pool, e
- * i poll che tengono viva la mappa aspetterebbero.
+ * raddoppierebbe i poll verso romamobilita.it, che ha un filtro anti-bot), e
+ * allo stesso modo quella di VehiclePositionsService, da cui prende quanto e'
+ * pieno ogni mezzo. Le scritture no: con un Postgres lento o spento
+ * occuperebbero thread del pool, e i poll che tengono viva la mappa
+ * aspetterebbero.
  *
  * IL BACKEND NON DIPENDE DAL DATABASE. Parte anche se Postgres non risponde
  * (initialization-fail-timeout=-1), la migrazione Flyway si tenta a ogni giro
@@ -88,6 +92,7 @@ public class PunctualityService {
     private static final Pattern PARTIZIONE = Pattern.compile("passaggi_(\\d{4})_(\\d{2})");
 
     private final TripUpdatesService tripUpdatesService;
+    private final VehiclePositionsService vehiclePositionsService;
     private final GtfsIndexService indexService;
     private final JdbcTemplate jdbc;
     private final DataSource dataSource;
@@ -162,13 +167,38 @@ public class PunctualityService {
         if (righe == null || righe.isEmpty()) {
             return;
         }
-        for (PunctualityCollector.Passaggio p : collector.osserva(righe, Instant.now())) {
+        Map<String, Integer> affollamenti = affollamentoPerCorsa(vehiclePositionsService.snapshot());
+        for (PunctualityCollector.Passaggio p : collector.osserva(righe, affollamenti, Instant.now())) {
             if (inCoda.incrementAndGet() > CODA_MASSIMA && coda.poll() != null) {
                 inCoda.decrementAndGet();
                 scartati.incrementAndGet();
             }
             coda.add(p);
         }
+    }
+
+    /**
+     * Per corsa, il codice OccupancyStatus che il mezzo dichiara nell'istantanea
+     * delle posizioni. I due feed escono insieme, una corsa per mezzo, quindi la
+     * corsa basta ad abbinarli. Un nome che la libreria non conosce si ignora.
+     */
+    static Map<String, Integer> affollamentoPerCorsa(List<VehiclePositionDTO> mezzi) {
+        Map<String, Integer> out = new HashMap<>();
+        if (mezzi == null) {
+            return out;
+        }
+        for (VehiclePositionDTO m : mezzi) {
+            if (m == null || m.getCorsa() == null || m.getOccupancyStatus() == null) {
+                continue;
+            }
+            try {
+                out.put(m.getCorsa(),
+                        GtfsRealtime.VehiclePosition.OccupancyStatus.valueOf(m.getOccupancyStatus()).getNumber());
+            } catch (IllegalArgumentException e) {
+                // valore aggiunto alla specifica dopo questa versione della libreria
+            }
+        }
+        return out;
     }
 
     /**
@@ -317,8 +347,9 @@ public class PunctualityService {
             for (int da = 0; da < lotto.size(); da += LOTTO) {
                 List<PunctualityCollector.Passaggio> parte = lotto.subList(da, Math.min(lotto.size(), da + LOTTO));
                 jdbc.batchUpdate("""
-                        INSERT INTO passaggi (giorno, osservato_il, linea, route_id, corsa, fermata, veicolo, ritardo_sec)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO passaggi (giorno, osservato_il, linea, route_id, corsa, fermata, veicolo, ritardo_sec,
+                                              affollamento)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """, parte, parte.size(), (ps, x) -> {
                     ps.setDate(1, Date.valueOf(giorno(x.primaVistaCorsa())));
                     ps.setObject(2, OffsetDateTime.ofInstant(x.quando(), ZoneOffset.UTC));
@@ -328,6 +359,11 @@ public class PunctualityService {
                     ps.setString(6, x.fermataId());
                     ps.setString(7, x.veicolo());
                     ps.setInt(8, (int) Math.round(x.ritardoMin() * 60));
+                    if (x.affollamento() == null) {
+                        ps.setNull(9, java.sql.Types.SMALLINT);
+                    } else {
+                        ps.setInt(9, x.affollamento());
+                    }
                 });
             }
         } catch (DataAccessException e) {

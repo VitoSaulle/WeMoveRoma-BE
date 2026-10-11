@@ -5,8 +5,10 @@ import org.junit.jupiter.api.Test;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -124,5 +126,68 @@ class PunctualityCollectorTest {
         assertEquals("736", prima.getFirst().veicolo());
 
         assertEquals(0, c.estraiCorse().getFirst().fermateNuove());
+    }
+
+    // ---- affollamento ----------------------------------------------------------
+
+    private static final int POSTI_LIBERI = 1;
+    private static final int IN_PIEDI = 3;
+    private static final int NESSUN_DATO = 7;
+
+    /** Il passaggio a B porta quanto era pieno il mezzo mentre andava verso B, non verso C. */
+    @Test
+    void ilPassaggioPortaLAffollamentoDellAvvicinamentoAllaFermata() {
+        PunctualityCollector c = new PunctualityCollector();
+        c.osserva(List.of(riga("T", "A", 0.0)), Map.of("T", POSTI_LIBERI), T0);
+        c.osserva(List.of(riga("T", "B", 1.0)), Map.of("T", POSTI_LIBERI), T0.plusSeconds(30));
+        c.osserva(List.of(riga("T", "B", 1.0)), Map.of("T", IN_PIEDI), T0.plusSeconds(60));
+        List<PunctualityCollector.Passaggio> out =
+                c.osserva(List.of(riga("T", "C", 1.0)), Map.of("T", POSTI_LIBERI), T0.plusSeconds(90));
+        assertEquals("B", out.getFirst().fermataId());
+        assertEquals(IN_PIEDI, out.getFirst().affollamento());
+    }
+
+    @Test
+    void unGiroSenzaDichiarazioneNonCancellaIlValoreVisto() {
+        PunctualityCollector c = new PunctualityCollector();
+        c.osserva(List.of(riga("T", "A", 0.0)), Map.of(), T0);
+        c.osserva(List.of(riga("T", "B", 1.0)), Map.of("T", IN_PIEDI), T0.plusSeconds(30));
+        // Il mezzo manca dalle posizioni per un giro, poi dice "nessun dato".
+        c.osserva(List.of(riga("T", "B", 1.0)), Map.of(), T0.plusSeconds(60));
+        c.osserva(List.of(riga("T", "B", 1.0)), Map.of("T", NESSUN_DATO), T0.plusSeconds(90));
+        List<PunctualityCollector.Passaggio> out = c.osserva(List.of(riga("T", "C", 1.0)), Map.of(), T0.plusSeconds(120));
+        assertEquals(IN_PIEDI, out.getFirst().affollamento());
+    }
+
+    /** Il valore visto verso B non si trascina su C: ogni fermata riparte da capo. */
+    @Test
+    void ogniFermataRiparteSenzaIlValoreDellaPrecedente() {
+        PunctualityCollector c = new PunctualityCollector();
+        c.osserva(List.of(riga("T", "A", 0.0)), Map.of(), T0);
+        c.osserva(List.of(riga("T", "B", 1.0)), Map.of("T", IN_PIEDI), T0.plusSeconds(30));
+        c.osserva(List.of(riga("T", "C", 1.0)), Map.of(), T0.plusSeconds(60));
+        List<PunctualityCollector.Passaggio> out = c.osserva(List.of(riga("T", "D", 1.0)), Map.of(), T0.plusSeconds(90));
+        assertEquals("C", out.getFirst().fermataId());
+        assertNull(out.getFirst().affollamento());
+    }
+
+    /** "Nessun dato" si salva cosi' com'e' quando e' tutto quello che il mezzo ha detto. */
+    @Test
+    void senzaUnValoreUtileRestaQuelloCheIlMezzoHaDichiarato() {
+        PunctualityCollector c = new PunctualityCollector();
+        c.osserva(List.of(riga("T", "A", 0.0)), Map.of(), T0);
+        c.osserva(List.of(riga("T", "B", 1.0)), Map.of("T", NESSUN_DATO), T0.plusSeconds(30));
+        List<PunctualityCollector.Passaggio> out = c.osserva(List.of(riga("T", "C", 1.0)), Map.of(), T0.plusSeconds(60));
+        assertEquals(NESSUN_DATO, out.getFirst().affollamento());
+    }
+
+    @Test
+    void senzaFeedDellePosizioniIPassaggiSiRegistranoComunque() {
+        PunctualityCollector c = new PunctualityCollector();
+        c.osserva(List.of(riga("T", "A", 0.0)), T0);
+        c.osserva(List.of(riga("T", "B", 1.0)), T0.plusSeconds(30));
+        List<PunctualityCollector.Passaggio> out = c.osserva(List.of(riga("T", "C", 1.0)), T0.plusSeconds(60));
+        assertEquals(1, out.size());
+        assertNull(out.getFirst().affollamento());
     }
 }
