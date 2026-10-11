@@ -1,11 +1,17 @@
 package it.roma.gtfs.gtfs_monitor.service;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
+import com.fasterxml.jackson.databind.json.JsonMapper;
 import it.roma.gtfs.gtfs_monitor.config.GtfsProperties;
 import it.roma.gtfs.gtfs_monitor.model.dto.VehiclePositionDTO;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.springframework.http.HttpStatus;
+import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
 import java.io.IOException;
@@ -16,10 +22,16 @@ import java.nio.file.Path;
 import java.time.Instant;
 import java.time.LocalDate;
 import java.time.ZoneId;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.function.BooleanSupplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -50,6 +62,10 @@ class VehiclePositionsSseServiceTest {
     Path dataDir;
 
     private VehiclePositionsSseService sseService;
+
+    /** Servizio con gli emitter finti di {@link #nextEmitters}: niente socket, invii osservabili. */
+    private VehiclePositionsSseService streamService;
+    private final Deque<RecordingEmitter> nextEmitters = new ArrayDeque<>();
 
     @BeforeEach
     void setUp() throws IOException {
@@ -112,6 +128,133 @@ class VehiclePositionsSseServiceTest {
         indexService.init();
         indexService.rebuildIndexes();
         sseService = new VehiclePositionsSseService(indexService, new ObjectMapper());
+        ObjectMapper json = JsonMapper.builder()
+                .findAndAddModules()
+                .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
+                .build();
+        streamService = new VehiclePositionsSseService(indexService, json) {
+            @Override
+            SseEmitter newEmitter() {
+                return nextEmitters.removeFirst();
+            }
+        };
+    }
+
+    @AfterEach
+    void tearDown() {
+        sseService.shutdown();
+        streamService.shutdown();
+    }
+
+    @Test
+    void unClienteCheNonLeggeRiceveSoloLoSnapshotPiuRecente() throws Exception {
+        CountDownLatch fermo = new CountDownLatch(1);
+        RecordingEmitter lento = subscribe(fermo, tick(0));
+
+        // Il primo invio (snapshot iniziale) resta bloccato sulla write: i cinque
+        // tick che arrivano nel frattempo non si accodano, vince l'ultimo.
+        for (int i = 1; i <= 5; i++) {
+            streamService.publish(List.of(), tick(i));
+        }
+        streamService.awaitDispatcherIdle();
+        fermo.countDown();
+
+        await(() -> lento.events.size() >= 2);
+        Thread.sleep(200);
+        assertEquals(2, lento.events.size(), lento.events.toString());
+        assertTrue(lento.events.get(0).contains(tick(0).toString()));
+        assertTrue(lento.events.get(1).contains(tick(5).toString()));
+    }
+
+    @Test
+    void unClienteBloccatoNonRallentaGliAltri() throws Exception {
+        CountDownLatch maiAperto = new CountDownLatch(1);
+        try {
+            RecordingEmitter bloccato = subscribe(maiAperto, tick(0));
+            RecordingEmitter veloce = subscribe(new CountDownLatch(0), tick(0));
+
+            streamService.publish(List.of(), tick(1));
+            streamService.awaitDispatcherIdle();
+            streamService.publish(List.of(), tick(2));
+
+            await(() -> !veloce.events.isEmpty() && veloce.events.getLast().contains(tick(2).toString()));
+            assertTrue(bloccato.events.isEmpty());
+        } finally {
+            maiAperto.countDown();
+        }
+    }
+
+    @Test
+    void senzaTickArrivaUnHeartbeat() throws Exception {
+        RecordingEmitter client = subscribe(new CountDownLatch(0), tick(0));
+        await(() -> client.events.size() == 1);
+
+        // Appena ricevuto lo snapshot: niente heartbeat.
+        streamService.sendHeartbeats(System.nanoTime());
+        // Quindici secondi dopo, feed fermo: un commento SSE.
+        streamService.sendHeartbeats(System.nanoTime() + VehiclePositionsSseService.HEARTBEAT_INTERVAL.toNanos());
+
+        await(() -> client.events.size() >= 2);
+        Thread.sleep(200);
+        assertEquals(2, client.events.size(), client.events.toString());
+        assertTrue(client.events.get(1).startsWith(":ping"), client.events.get(1));
+    }
+
+    @Test
+    void oltreIlLimiteDiClientLoStreamRisponde503() throws Exception {
+        ReflectionTestUtils.setField(streamService, "maxSubscribers", 1);
+        subscribe(new CountDownLatch(0), tick(0));
+
+        nextEmitters.add(new RecordingEmitter(new CountDownLatch(0)));
+        ResponseStatusException rifiuto = assertThrows(ResponseStatusException.class,
+                () -> streamService.subscribe(List.of(), tick(0)));
+        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, rifiuto.getStatusCode());
+    }
+
+    private RecordingEmitter subscribe(CountDownLatch gate, Instant generatedAt) throws Exception {
+        RecordingEmitter emitter = new RecordingEmitter(gate);
+        nextEmitters.add(emitter);
+        streamService.subscribe(List.of(), generatedAt);
+        streamService.awaitDispatcherIdle();
+        return emitter;
+    }
+
+    private static Instant tick(int i) {
+        return NOW.plusSeconds(5L * i);
+    }
+
+    private static void await(BooleanSupplier condition) throws InterruptedException {
+        long deadline = System.nanoTime() + 5_000_000_000L;
+        while (!condition.getAsBoolean()) {
+            if (System.nanoTime() > deadline) {
+                throw new AssertionError("condizione non raggiunta entro 5 secondi");
+            }
+            Thread.sleep(10);
+        }
+    }
+
+    /** Emitter senza socket: registra gli eventi e, finche' il gate e' chiuso, blocca la write come un client che non legge. */
+    private static final class RecordingEmitter extends SseEmitter {
+        private final List<String> events = new CopyOnWriteArrayList<>();
+        private final CountDownLatch gate;
+
+        private RecordingEmitter(CountDownLatch gate) {
+            super(0L);
+            this.gate = gate;
+        }
+
+        @Override
+        public void send(SseEventBuilder builder) throws IOException {
+            try {
+                gate.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException(e);
+            }
+            StringBuilder event = new StringBuilder();
+            builder.build().forEach(part -> event.append(part.getData()));
+            events.add(event.toString());
+        }
     }
 
     @Test

@@ -5,13 +5,18 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiListResponseDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiVehicleDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.VehiclePositionDTO;
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
 import org.springframework.web.servlet.mvc.method.annotation.SseEmitter;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
@@ -26,7 +31,26 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
+/**
+ * Stream SSE delle posizioni dei mezzi.
+ *
+ * Due livelli, perche' un client che tiene aperta la connessione ma non legge non
+ * rallenti gli altri:
+ * <ul>
+ *   <li>dispatcher (un thread): filtra, simula le corse senza GPS e serializza. Non
+ *       scrive mai su un socket, quindi non si blocca su un client lento. Dei tick
+ *       arrivati mentre lavora tiene solo l'ultimo: quelli vecchi non servono a nessuno;</li>
+ *   <li>invio: per ogni client al massimo un virtual thread alla volta, che scrive il
+ *       payload piu' recente. Se il client e' fermo, il suo thread resta bloccato sulla
+ *       write (fino al timeout di Tomcat, server.tomcat.connection-timeout) e intanto
+ *       i payload nuovi sostituiscono quello in attesa invece di accodarsi.</li>
+ * </ul>
+ */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -34,20 +58,49 @@ public class VehiclePositionsSseService {
     private static final ZoneId ROME = ZoneId.of("Europe/Rome");
     private static final DateTimeFormatter ISO_ROME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss XXX").withZone(ROME);
 
+    /**
+     * Senza eventi per questo tempo (feed GTFS-RT fermo) il client riceve un commento SSE:
+     * le connessioni morte emergono alla scrittura e i proxy non chiudono quelle inattive.
+     */
+    static final Duration HEARTBEAT_INTERVAL = Duration.ofSeconds(15);
+
+    /**
+     * Un invio fermo da piu' di cosi' e' un client che non legge (o legge a gocce, senza mai
+     * far scattare il timeout di scrittura): lo togliamo dai destinatari.
+     */
+    static final Duration SLOW_SEND_LIMIT = Duration.ofSeconds(30);
+
     private final GtfsIndexService gtfsIndexService;
     private final ObjectMapper objectMapper;
     private final Set<Subscription> emitters = ConcurrentHashMap.newKeySet();
 
-    /**
-     * Executor singolo dedicato all'invio SSE: emitter.send è bloccante, quindi un client
-     * lento non deve mai bloccare il thread di polling GTFS-RT. Un solo thread garantisce
-     * anche l'ordine sequenziale degli eventi verso ogni emitter.
-     */
-    private final ExecutorService sendExecutor = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "vehicle-positions-sse-send");
+    /** Oltre questo numero di client contemporanei lo stream risponde 503. */
+    @Value("${vehicles.sse.max-subscribers:500}")
+    private int maxSubscribers = 500;
+
+    /** Ultimo snapshot pubblicato e non ancora distribuito: un tick nuovo sostituisce quello in attesa. */
+    private final AtomicReference<Tick> pendingTick = new AtomicReference<>();
+
+    private final ScheduledExecutorService dispatcher = Executors.newSingleThreadScheduledExecutor(r -> {
+        Thread t = new Thread(r, "vehicle-positions-sse-dispatch");
         t.setDaemon(true);
         return t;
     });
+
+    private final ExecutorService sendExecutor = Executors.newThreadPerTaskExecutor(
+            Thread.ofVirtual().name("vehicle-positions-sse-send-", 0).factory());
+
+    @PostConstruct
+    void startHeartbeat() {
+        long periodMillis = HEARTBEAT_INTERVAL.toMillis();
+        dispatcher.scheduleWithFixedDelay(() -> {
+            try {
+                sendHeartbeats(System.nanoTime());
+            } catch (RuntimeException e) {
+                log.warn("[VehiclePositionsSse] heartbeat fallito: {}", e.toString());
+            }
+        }, periodMillis, periodMillis, TimeUnit.MILLISECONDS);
+    }
 
     public SseEmitter subscribe(List<VehiclePositionDTO> snapshot, Instant generatedAt) {
         return subscribe(snapshot, generatedAt, null, null, null);
@@ -60,7 +113,11 @@ public class VehiclePositionsSseService {
             String destination,
             String vehicleId
     ) {
-        SseEmitter emitter = new SseEmitter(0L);
+        if (emitters.size() >= maxSubscribers) {
+            log.warn("[VehiclePositionsSse] {} client gia' collegati, nuova sottoscrizione rifiutata", emitters.size());
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE, "Troppi client collegati allo stream dei mezzi");
+        }
+        SseEmitter emitter = newEmitter();
         Subscription subscription = new Subscription(emitter, linea, normalizeText(destination), vehicleId);
         emitters.add(subscription);
 
@@ -71,11 +128,14 @@ public class VehiclePositionsSseService {
         });
         emitter.onError((ex) -> emitters.remove(subscription));
 
-        // Snapshot iniziale sullo stesso executor dei tick: ordine sequenziale garantito.
-        enqueue(() -> {
-            if (!sendSnapshot(subscription, snapshot, generatedAt)) {
-                emitters.remove(subscription);
+        // Snapshot iniziale preparato sul dispatcher come i tick, e solo dopo la
+        // sottoscrizione entra nei tick: un tick piu' recente non puo' precederlo.
+        runOnDispatcher(() -> {
+            String json = toJson(toApiResponse(filterSnapshot(snapshot, subscription, generatedAt), generatedAt));
+            if (json != null) {
+                offer(subscription, new Outgoing(json));
             }
+            subscription.ready = true;
         });
         return emitter;
     }
@@ -84,22 +144,41 @@ public class VehiclePositionsSseService {
         if (emitters.isEmpty()) {
             return;
         }
-        List<Subscription> targets = List.copyOf(emitters);
-        // L'invio (mapping DTO + serializzazione JSON + send bloccante) avviene sull'executor
-        // dedicato: il chiamante (thread di polling) ritorna subito.
-        enqueue(() -> dispatch(targets, snapshot, generatedAt));
+        // Il chiamante (thread di polling) ritorna subito. Se il dispatcher e' ancora
+        // indietro, lo snapshot sostituisce quello in attesa invece di accodarsi.
+        if (pendingTick.getAndSet(new Tick(snapshot, generatedAt)) == null) {
+            runOnDispatcher(this::dispatchPendingTick);
+        }
     }
 
     @PreDestroy
     public void shutdown() {
+        dispatcher.shutdownNow();
         sendExecutor.shutdownNow();
     }
 
-    private void enqueue(Runnable task) {
+    /** Punto di estensione per i test, che sostituiscono la scrittura sul socket. */
+    SseEmitter newEmitter() {
+        return new SseEmitter(0L);
+    }
+
+    /** Per i test: attende che il dispatcher abbia smaltito il lavoro gia' in coda. */
+    void awaitDispatcherIdle() throws Exception {
+        dispatcher.submit(() -> { }).get(5, TimeUnit.SECONDS);
+    }
+
+    private void runOnDispatcher(Runnable task) {
         try {
-            sendExecutor.execute(task);
+            dispatcher.execute(task);
         } catch (RejectedExecutionException e) {
-            log.debug("[VehiclePositionsSse] executor spento, invio scartato: {}", e.toString());
+            log.debug("[VehiclePositionsSse] dispatcher spento, invio scartato: {}", e.toString());
+        }
+    }
+
+    private void dispatchPendingTick() {
+        Tick tick = pendingTick.getAndSet(null);
+        if (tick != null) {
+            dispatch(List.copyOf(emitters), tick.snapshot(), tick.generatedAt());
         }
     }
 
@@ -108,9 +187,16 @@ public class VehiclePositionsSseService {
         // Un solo payload serializzato per gruppo di filtri identici: nel caso comune
         // (nessun filtro) tutti i subscriber condividono la stessa stringa JSON.
         Map<FilterKey, String> payloadByFilter = new HashMap<>();
+        long now = System.nanoTime();
         for (Subscription subscription : targets) {
-            if (!emitters.contains(subscription)) {
-                continue; // rimosso nel frattempo (completion/timeout/errore)
+            if (!subscription.ready || !emitters.contains(subscription)) {
+                continue; // snapshot iniziale non ancora pronto, o rimosso nel frattempo
+            }
+            long sendStarted = subscription.sendStartedNanos;
+            if (sendStarted != 0L && now - sendStarted > SLOW_SEND_LIMIT.toNanos()) {
+                log.info("[VehiclePositionsSse] client fermo da oltre {}s, scollegato", SLOW_SEND_LIMIT.toSeconds());
+                emitters.remove(subscription);
+                continue;
             }
             FilterKey key = subscription.filterKey();
             String json = payloadByFilter.get(key);
@@ -123,9 +209,98 @@ public class VehiclePositionsSseService {
                 }
                 payloadByFilter.put(key, json);
             }
-            if (!sendJson(subscription, json)) {
-                emitters.remove(subscription);
+            offer(subscription, new Outgoing(json));
+        }
+    }
+
+    /** Un commento SSE a chi non riceve nulla da HEARTBEAT_INTERVAL. Gira sul dispatcher. */
+    void sendHeartbeats(long nowNanos) {
+        for (Subscription subscription : emitters) {
+            if (subscription.ready && nowNanos - subscription.lastOfferNanos >= HEARTBEAT_INTERVAL.toNanos()) {
+                offer(subscription, Outgoing.HEARTBEAT);
             }
+        }
+    }
+
+    /**
+     * Consegna il messaggio al client senza bloccare il chiamante. Al massimo un invio
+     * per client e' in corso: quello che arriva nel frattempo prende il posto del
+     * messaggio in attesa (un heartbeat no: non scavalca dati veri).
+     */
+    private void offer(Subscription subscription, Outgoing message) {
+        subscription.lastOfferNanos = System.nanoTime();
+        if (message == Outgoing.HEARTBEAT) {
+            if (!subscription.pending.compareAndSet(null, message)) {
+                return;
+            }
+        } else {
+            subscription.pending.set(message);
+        }
+        if (subscription.sending.compareAndSet(false, true)) {
+            try {
+                sendExecutor.execute(() -> drain(subscription));
+            } catch (RejectedExecutionException e) {
+                subscription.sending.set(false);
+                log.debug("[VehiclePositionsSse] executor spento, invio scartato: {}", e.toString());
+            }
+        }
+    }
+
+    /** Gira sul virtual thread del client: scrive finche' c'e' un messaggio in attesa. */
+    private void drain(Subscription subscription) {
+        while (true) {
+            Outgoing next = subscription.pending.getAndSet(null);
+            if (next == null) {
+                subscription.sending.set(false);
+                // Un offer arrivato fra il getAndSet e qui ha trovato sending=true e non ha
+                // avviato nessuno: il suo messaggio lo mandiamo noi.
+                if (subscription.pending.get() == null || !subscription.sending.compareAndSet(false, true)) {
+                    return;
+                }
+                continue;
+            }
+            if (!emitters.contains(subscription)) {
+                // Scollegato perche' troppo lento (o gia' chiuso): sending resta true,
+                // cosi' nessuno avvia piu' invii verso questo client.
+                completeQuietly(subscription.emitter());
+                return;
+            }
+            if (!send(subscription, next)) {
+                emitters.remove(subscription);
+                return;
+            }
+        }
+    }
+
+    private boolean send(Subscription subscription, Outgoing message) {
+        subscription.sendStartedNanos = System.nanoTime();
+        try {
+            if (message == Outgoing.HEARTBEAT) {
+                subscription.emitter().send(SseEmitter.event().comment("ping"));
+            } else {
+                subscription.emitter().send(SseEmitter.event()
+                        .name("vehicles")
+                        .data(message.json(), MediaType.APPLICATION_JSON));
+            }
+            return true;
+        } catch (Exception e) {
+            try {
+                subscription.emitter().completeWithError(e);
+            } catch (Exception ignored) {
+                // no-op
+            }
+            log.debug("[VehiclePositionsSse] emitter closed: {}", e.toString());
+            return false;
+        } finally {
+            subscription.sendStartedNanos = 0L;
+        }
+    }
+
+    private static void completeQuietly(SseEmitter emitter) {
+        try {
+            emitter.complete();
+        } catch (Exception ignored) {
+            // no-op
         }
     }
 
@@ -146,31 +321,6 @@ public class VehiclePositionsSseService {
             }
         }
         return cache;
-    }
-
-    private boolean sendSnapshot(Subscription subscription, List<VehiclePositionDTO> snapshot, Instant generatedAt) {
-        String json = toJson(toApiResponse(filterSnapshot(snapshot, subscription, generatedAt), generatedAt));
-        if (json == null) {
-            return true; // errore di serializzazione già loggato, l'emitter resta attivo
-        }
-        return sendJson(subscription, json);
-    }
-
-    private boolean sendJson(Subscription subscription, String json) {
-        try {
-            subscription.emitter().send(SseEmitter.event()
-                    .name("vehicles")
-                    .data(json, MediaType.APPLICATION_JSON));
-            return true;
-        } catch (Exception e) {
-            try {
-                subscription.emitter().completeWithError(e);
-            } catch (Exception ignored) {
-                // no-op
-            }
-            log.debug("[VehiclePositionsSse] emitter closed: {}", e.toString());
-            return false;
-        }
     }
 
     private String toJson(ApiListResponseDTO<ApiVehicleDTO> response) {
@@ -334,12 +484,35 @@ public class VehiclePositionsSseService {
         return new Position(lat, lon);
     }
 
-    private record Subscription(
-            SseEmitter emitter,
-            String linea,
-            String normalizedDestination,
-            String vehicleId
-    ) {
+
+    private static final class Subscription {
+        private final SseEmitter emitter;
+        private final String linea;
+        private final String normalizedDestination;
+        private final String vehicleId;
+
+        /** Messaggio in attesa di invio: ne resta al massimo uno, il piu' recente. */
+        private final AtomicReference<Outgoing> pending = new AtomicReference<>();
+        /** true mentre un virtual thread sta scrivendo verso questo client. */
+        private final AtomicBoolean sending = new AtomicBoolean();
+        /** Diventa true dopo lo snapshot iniziale: prima i tick non lo includono. */
+        private volatile boolean ready;
+        private volatile long lastOfferNanos = System.nanoTime();
+        /** Inizio della scrittura in corso, 0 se nessuna. */
+        private volatile long sendStartedNanos;
+
+        private Subscription(SseEmitter emitter, String linea, String normalizedDestination, String vehicleId) {
+            this.emitter = emitter;
+            this.linea = linea;
+            this.normalizedDestination = normalizedDestination;
+            this.vehicleId = vehicleId;
+        }
+
+        private SseEmitter emitter() { return emitter; }
+        private String linea() { return linea; }
+        private String normalizedDestination() { return normalizedDestination; }
+        private String vehicleId() { return vehicleId; }
+
         private FilterKey filterKey() {
             return new FilterKey(linea, normalizedDestination, vehicleId);
         }
@@ -347,6 +520,13 @@ public class VehiclePositionsSseService {
 
     /** Chiave di raggruppamento: subscriber con filtri identici condividono lo stesso payload JSON. */
     private record FilterKey(String linea, String normalizedDestination, String vehicleId) {}
+
+    private record Tick(List<VehiclePositionDTO> snapshot, Instant generatedAt) {}
+
+    /** Evento da scrivere: il JSON dei mezzi, oppure (json null) l'heartbeat. */
+    private record Outgoing(String json) {
+        private static final Outgoing HEARTBEAT = new Outgoing(null);
+    }
 
     private record Position(double lat, double lon) {}
 }
