@@ -211,16 +211,16 @@ public class ServiceAlertsService {
                 cacheRef.set(current.withAttempt(now));
                 return;
             }
+            // Un feed letto bene si accetta sempre, anche senza avvisi: prima uno
+            // vuoto veniva scartato e gli avvisi gia' chiusi restavano serviti per
+            // sempre. Il caso del singhiozzo upstream non preoccupa: chi rientra
+            // nel feed e' gia' nel tracker, e non riparte una seconda push.
             List<ServiceAlertDTO> fresh = fetched.get();
-            if (!fresh.isEmpty() || current.isEmpty()) {
-                cacheRef.set(new CacheEntry<>(List.copyOf(fresh), now, now));
-                try {
-                    dispatchNewAlertsToFcm(fresh);
-                } catch (Exception e) {
-                    log.warn("[ServiceAlerts] dispatch push fallito: {}", e.toString());
-                }
-            } else {
-                cacheRef.set(current.withAttempt(now));
+            cacheRef.set(new CacheEntry<>(List.copyOf(fresh), now, now));
+            try {
+                dispatchNewAlertsToFcm(fresh);
+            } catch (Exception e) {
+                log.warn("[ServiceAlerts] dispatch push fallito: {}", e.toString());
             }
         }
     }

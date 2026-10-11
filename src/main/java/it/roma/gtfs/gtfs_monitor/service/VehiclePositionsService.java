@@ -37,6 +37,19 @@ public class VehiclePositionsService {
      */
     private static final Duration FEED_BLOCK_TIMEOUT = Duration.ofSeconds(10);
 
+    /**
+     * Un feed valido ma senza entita' si accetta solo se dura: i dati
+     * precedenti restano serviti finche' sono piu' giovani di cosi'.
+     *
+     * <p>Prima un feed vuoto non veniva mai accettato, e i mezzi (o gli arrivi)
+     * dell'ultimo feed pieno restavano in cache per sempre: a fine servizio
+     * l'app avrebbe mostrato i bus della sera fermi sulla mappa. Accettarlo
+     * subito pero' e' rischioso: un feed vuoto per un giro e' piu' spesso un
+     * singhiozzo dell'upstream che una rete davvero ferma (a Roma di notte
+     * girano le linee N). Un minuto di feed vuoti di fila e' un segnale vero.
+     */
+    static final long EMPTY_FEED_GRACE_MILLIS = 60_000L;
+
     private static final ZoneId ROME = ZoneId.of("Europe/Rome");
     private static final DateTimeFormatter ISO_ROME = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss XXX").withZone(ROME);
 
@@ -151,7 +164,8 @@ public class VehiclePositionsService {
                 return;
             }
             List<VehiclePositionDTO> fresh = fetched.get();
-            if (!fresh.isEmpty() || current.isEmpty()) {
+            boolean emptyForLong = now - current.loadedAtMillis() > EMPTY_FEED_GRACE_MILLIS;
+            if (!fresh.isEmpty() || current.isEmpty() || emptyForLong) {
                 List<VehiclePositionDTO> immutable = List.copyOf(fresh);
                 cacheRef.set(new CacheEntry<>(immutable, now, now));
                 vehiclePositionsSseService.publish(immutable, Instant.ofEpochMilli(now));

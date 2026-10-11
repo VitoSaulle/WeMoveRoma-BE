@@ -35,6 +35,19 @@ public class TripUpdatesService {
      */
     private static final Duration FEED_BLOCK_TIMEOUT = Duration.ofSeconds(10);
 
+    /**
+     * Un feed valido ma senza entita' si accetta solo se dura: i dati
+     * precedenti restano serviti finche' sono piu' giovani di cosi'.
+     *
+     * <p>Prima un feed vuoto non veniva mai accettato, e i mezzi (o gli arrivi)
+     * dell'ultimo feed pieno restavano in cache per sempre: a fine servizio
+     * l'app avrebbe mostrato i bus della sera fermi sulla mappa. Accettarlo
+     * subito pero' e' rischioso: un feed vuoto per un giro e' piu' spesso un
+     * singhiozzo dell'upstream che una rete davvero ferma (a Roma di notte
+     * girano le linee N). Un minuto di feed vuoti di fila e' un segnale vero.
+     */
+    static final long EMPTY_FEED_GRACE_MILLIS = 60_000L;
+
     private final GtfsProperties props;
     private final WebClient webClient;
     private final GtfsIndexService indexService;
@@ -167,7 +180,8 @@ public class TripUpdatesService {
                 return;
             }
             List<TripUpdateDTO> fresh = fetched.get();
-            if (!fresh.isEmpty() || current.isEmpty()) {
+            boolean emptyForLong = now - current.loadedAtMillis() > EMPTY_FEED_GRACE_MILLIS;
+            if (!fresh.isEmpty() || current.isEmpty() || emptyForLong) {
                 cacheRef.set(new CacheEntry<>(List.copyOf(fresh), now, now));
             } else {
                 cacheRef.set(current.withAttempt(now));
