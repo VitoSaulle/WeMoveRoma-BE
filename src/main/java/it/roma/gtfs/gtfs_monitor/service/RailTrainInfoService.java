@@ -20,6 +20,7 @@ import java.time.LocalDateTime;
 import java.time.LocalTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneId;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -46,6 +47,8 @@ public class RailTrainInfoService {
     private static final Pattern AUTOCOMPLETE_ENTRY_PATTERN = Pattern.compile("^(.*?)\\|(\\d+)-([A-Z0-9]+)-(\\d+)$");
     private static final Duration CACHE_TTL = Duration.ofSeconds(45);
     private static final ZoneId ROME_ZONE = ZoneId.of("Europe/Rome");
+    /** Ogni chiave vive 45 secondi, ma senza tetto quelle scadute restavano in memoria per sempre. */
+    static final int MAX_CACHE_ENTRIES = 2_000;
 
     private final WebClient webClient;
     private final ObjectMapper objectMapper;
@@ -73,8 +76,23 @@ public class RailTrainInfoService {
         }
 
         RailTrainInfoDTO parsed = fetchTrainInfo(normalizedTrainNumber, stationName, referenceTime);
-        cache.put(cacheKey, new CachedRailTrainInfo(parsed, Instant.now().plus(CACHE_TTL)));
+        remember(cacheKey, parsed);
         return Optional.ofNullable(parsed);
+    }
+
+    private void remember(String cacheKey, RailTrainInfoDTO value) {
+        Instant now = Instant.now();
+        if (cache.size() >= MAX_CACHE_ENTRIES) {
+            cache.values().removeIf(entry -> !entry.expiresAt().isAfter(now));
+            if (cache.size() >= MAX_CACHE_ENTRIES) {
+                cache.clear();
+            }
+        }
+        cache.put(cacheKey, new CachedRailTrainInfo(value, now.plus(CACHE_TTL)));
+    }
+
+    int cacheSize() {
+        return cache.size();
     }
 
     private RailTrainInfoDTO fetchTrainInfo(String trainNumber, String stationName, OffsetDateTime referenceTime) {
@@ -863,8 +881,15 @@ public class RailTrainInfoService {
         return raw.replaceAll("\\s+", "");
     }
 
-    private static String normalizeReferenceTimeKey(OffsetDateTime referenceTime) {
-        return referenceTime == null ? "" : referenceTime.toString();
+    /*
+     * Al minuto, sull'ora di Roma: il client manda l'istante con secondi e
+     * millisecondi e nel suo fuso, e con la chiave intera due richieste dello
+     * stesso treno non si incontravano quasi mai in cache.
+     */
+    static String normalizeReferenceTimeKey(OffsetDateTime referenceTime) {
+        return referenceTime == null
+                ? ""
+                : referenceTime.atZoneSameInstant(ROME_ZONE).toLocalDateTime().truncatedTo(ChronoUnit.MINUTES).toString();
     }
 
     private static boolean matchesReferenceTime(RailTrainInfoDTO info, OffsetDateTime referenceTime) {
