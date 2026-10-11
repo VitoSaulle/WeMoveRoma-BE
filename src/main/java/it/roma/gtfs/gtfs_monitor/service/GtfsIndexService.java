@@ -149,6 +149,13 @@ public class GtfsIndexService {
         Map<String, String> routeShortNames = loadRouteShortNames(routesPath);
         Map<String, Integer> routeTypes = loadRouteTypes(routesPath);
         Map<String, Trip> trips = loadTrips(tripsPath);
+        // Un feed senza fermate o senza corse non e' un feed: pubblicarlo
+        // svuoterebbe il catalogo. Si fallisce prima di toccare gli indici, cosi'
+        // restano quelli vecchi e chi aggiorna i file ripristina il backup.
+        if (stops.isEmpty() || trips.isEmpty()) {
+            throw new IOException("Feed GTFS incompleto: stops=" + stops.size() + " trips=" + trips.size()
+                    + ", indici non aggiornati");
+        }
         Map<String, List<ShapePoint>> shapesById = loadShapes(shapesPath, referencedShapeIds(trips));
         CalendarDatesIndex calendarDates = loadCalendarDates(calendarDatesPath);
         Map<String, Set<String>> byRoute = buildRouteIndex(trips);
@@ -184,10 +191,6 @@ public class GtfsIndexService {
         long ms = (System.nanoTime() - t0) / 1_000_000;
         log.info("[GTFS-Index] Indici ricostruiti: stops={} trips={} routes={} in {} ms",
                 stops.size(), trips.size(), byRoute.size(), ms);
-
-        if (trips.isEmpty()) {
-            log.warn("[GTFS-Index] ATTENZIONE: trips e' vuoto. Trip headsign e shape non funzioneranno.");
-        }
 
         scheduleWarmup(generation);
     }

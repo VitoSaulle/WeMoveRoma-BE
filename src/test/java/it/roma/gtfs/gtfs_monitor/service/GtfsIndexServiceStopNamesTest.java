@@ -44,6 +44,11 @@ class GtfsIndexServiceStopNamesTest {
                 71967,71967,"_",,41.932564,12.594687,,,,,
                 70509,70509,"ZAMA",,41.876125,12.510183,,,,,
                 """);
+        // Una corsa qualsiasi: un feed senza corse non viene pubblicato.
+        Files.writeString(dataDir.resolve("trips.txt"), """
+                route_id,service_id,trip_id,trip_headsign,trip_short_name,direction_id,block_id,shape_id,wheelchair_accessible,exceptional
+                R1,SVC1,T1,Termini,,0,,,1,0
+                """);
 
         GtfsProperties props = new GtfsProperties(
                 new GtfsProperties.StaticProps(null, dataDir.toString(), 0L),
