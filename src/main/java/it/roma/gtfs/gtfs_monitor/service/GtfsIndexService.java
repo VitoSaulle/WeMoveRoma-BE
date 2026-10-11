@@ -40,6 +40,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Pattern;
 
 @Slf4j
 @Service
@@ -161,6 +162,7 @@ public class GtfsIndexService {
         Map<String, Set<String>> byRoute = buildRouteIndex(trips);
         Map<String, Set<String>> destinationsByRoute = buildDestinationsIndex(trips);
         Map<String, Set<String>> routeIdsByLine = buildRouteIdsByLineIndex(routeShortNames, byRoute.keySet());
+        Map<String, Set<String>> routeIdsByNormalizedLine = buildRouteIdsByNormalizedLineIndex(routeIdsByLine);
         StopTimesOffsetIndex stopTimesOffsets = buildStopTimesOffsetIndex(stopTimesPath, trips);
 
         ref.set(new Indexes(
@@ -171,6 +173,7 @@ public class GtfsIndexService {
                 routeShortNames,
                 routeTypes,
                 routeIdsByLine,
+                routeIdsByNormalizedLine,
                 shapesById,
                 calendarDates.addedByDate(),
                 calendarDates.removedByDate()
@@ -1148,6 +1151,17 @@ public class GtfsIndexService {
         return out;
     }
 
+    /** Linee raggruppate per nome normalizzato: "MEA" e "mea" finiscono insieme. */
+    private static Map<String, Set<String>> buildRouteIdsByNormalizedLineIndex(Map<String, Set<String>> routeIdsByLine) {
+        Map<String, Set<String>> out = new HashMap<>(Math.max(16, routeIdsByLine.size()));
+        for (Map.Entry<String, Set<String>> entry : routeIdsByLine.entrySet()) {
+            String normalized = normalizeText(entry.getKey());
+            if (normalized == null) continue;
+            out.computeIfAbsent(normalized, ignored -> new LinkedHashSet<>()).addAll(entry.getValue());
+        }
+        return out;
+    }
+
     private Set<String> referencedShapeIds(Map<String, Trip> trips) {
         Set<String> shapeIds = new HashSet<>(Math.max(16, trips.size() / 2));
         for (Trip trip : trips.values()) {
@@ -1390,37 +1404,60 @@ public class GtfsIndexService {
             String normalizedDestination,
             long nowEpochSeconds
     ) {
+        Indexes indexes = ref.get();
+        // Si parte dalle corse della linea e non da tutte quelle del giorno: prima
+        // ogni poll normalizzava (Normalizer + tre regex) il nome della linea di
+        // ognuna delle decine di migliaia di corse attive, per tenerne qualche decina.
+        Set<String> routeIds = indexes.routeIdsByNormalizedLine().getOrDefault(normalizedLine, Set.of());
+        if (routeIds.isEmpty()) {
+            return;
+        }
         ActiveTripIndex index = activeTripIndexForDate(serviceDate);
         if (index.byTripId().isEmpty()) {
             return;
         }
 
-        for (ActiveTripSchedule schedule : index.byTripId().values()) {
-            Trip trip = tripByIdOrNull(schedule.tripId());
-            if (trip == null) continue;
-            String publicLine = publicLineByRouteId(trip.routeId());
-            if (!Objects.equals(normalizeText(publicLine), normalizedLine)) continue;
-            if (normalizedDestination != null && !Objects.equals(normalizeText(trip.headsign()), normalizedDestination)) continue;
-
-            List<ShapePoint> shape = shapeByTripId(schedule.tripId());
-            if (shape.size() < 2) continue;
-
-            long serviceStartEpochSeconds = serviceDayAnchorEpochSeconds(serviceDate);
-            long startEpochSeconds = serviceStartEpochSeconds + schedule.startTimeSeconds();
-            long endEpochSeconds = serviceStartEpochSeconds + schedule.endTimeSeconds();
-            if (endEpochSeconds < nowEpochSeconds - 5 * 60L) continue;
-            if (startEpochSeconds > nowEpochSeconds + 45 * 60L) continue;
-
-            out.add(new SimulatedTrip(
-                    publicLine,
-                    trip.headsign(),
-                    schedule.tripId(),
-                    startEpochSeconds,
-                    endEpochSeconds,
-                    shape,
-                    wheelchairAccessible(trip.wheelchair())
-            ));
+        long serviceStartEpochSeconds = serviceDayAnchorEpochSeconds(serviceDate);
+        for (String routeId : routeIds) {
+            for (String tripId : indexes.tripsByRoute().getOrDefault(routeId, Set.of())) {
+                ActiveTripSchedule schedule = index.byTripId().get(tripId);
+                if (schedule == null) continue;
+                collectSimulatedTrip(out, indexes, schedule, normalizedDestination, serviceStartEpochSeconds, nowEpochSeconds);
+            }
         }
+    }
+
+    private void collectSimulatedTrip(
+            List<SimulatedTrip> out,
+            Indexes indexes,
+            ActiveTripSchedule schedule,
+            String normalizedDestination,
+            long serviceStartEpochSeconds,
+            long nowEpochSeconds
+    ) {
+        // Prima la finestra oraria, che e' solo aritmetica: scarta quasi tutte le
+        // corse del giorno prima di normalizzare capolinea o cercare tracciati.
+        long startEpochSeconds = serviceStartEpochSeconds + schedule.startTimeSeconds();
+        long endEpochSeconds = serviceStartEpochSeconds + schedule.endTimeSeconds();
+        if (endEpochSeconds < nowEpochSeconds - 5 * 60L) return;
+        if (startEpochSeconds > nowEpochSeconds + 45 * 60L) return;
+
+        Trip trip = indexes.trips().get(schedule.tripId());
+        if (trip == null) return;
+        if (normalizedDestination != null && !Objects.equals(normalizeText(trip.headsign()), normalizedDestination)) return;
+
+        List<ShapePoint> shape = shapeByTripId(schedule.tripId());
+        if (shape.size() < 2) return;
+
+        out.add(new SimulatedTrip(
+                publicLineByRouteId(trip.routeId()),
+                trip.headsign(),
+                schedule.tripId(),
+                startEpochSeconds,
+                endEpochSeconds,
+                shape,
+                wheelchairAccessible(trip.wheelchair())
+        ));
     }
 
     private Optional<SimulatedTrip> simulatedTripByIdOnDate(String tripId, LocalDate serviceDate, long nowEpochSeconds) {
@@ -1974,14 +2011,17 @@ public class GtfsIndexService {
         }
     }
 
+    // Compilate una volta: String.replaceAll ricompila il pattern a ogni chiamata.
+    private static final Pattern DIACRITICI = Pattern.compile("\\p{M}+");
+    private static final Pattern NON_ALFANUMERICI = Pattern.compile("[^\\p{Alnum}]+");
+    private static final Pattern SPAZI = Pattern.compile("\\s+");
+
     private static String normalizeText(String value) {
         if (value == null) return null;
-        String normalized = java.text.Normalizer.normalize(value, java.text.Normalizer.Form.NFD)
-                .replaceAll("\\p{M}+", "")
-                .toLowerCase(Locale.ROOT)
-                .replaceAll("[^\\p{Alnum}]+", " ")
-                .trim()
-                .replaceAll("\\s+", " ");
+        String senzaAccenti = DIACRITICI.matcher(
+                java.text.Normalizer.normalize(value, java.text.Normalizer.Form.NFD)).replaceAll("");
+        String soloAlfanumerici = NON_ALFANUMERICI.matcher(senzaAccenti.toLowerCase(Locale.ROOT)).replaceAll(" ");
+        String normalized = SPAZI.matcher(soloAlfanumerici.trim()).replaceAll(" ");
         return normalized.isEmpty() ? null : normalized;
     }
 
@@ -2041,11 +2081,13 @@ public class GtfsIndexService {
             Map<String, String> routeShortNameByRouteId,
             Map<String, Integer> routeTypeByRouteId,
             Map<String, Set<String>> routeIdsByPublicLine,
+            // Stesse linee, con il nome normalizzato come lo confronta simulatedTripsInService.
+            Map<String, Set<String>> routeIdsByNormalizedLine,
             Map<String, List<ShapePoint>> shapesById,
             Map<LocalDate, Set<String>> addedServiceIdsByDate,
             Map<LocalDate, Set<String>> removedServiceIdsByDate
     ) {
-        static final Indexes EMPTY = new Indexes(Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
+        static final Indexes EMPTY = new Indexes(Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of(), Map.of());
     }
 
     public record Stop(
