@@ -533,26 +533,68 @@ public class GtfsIndexService {
         return List.copyOf(out);
     }
 
-    public List<SimulatedTrip> simulatedTrips(String line, String destination, Instant now, int limit) {
+    /** Oltre non serve: la linea piu' fitta (metro A all'ora di punta) ne ha una trentina. */
+    private static final int MAX_SIMULATED_TRIPS_IN_SERVICE = 80;
+    /** Fino a quest'ora girano ancora corse del giorno di servizio di ieri: le notturne arrivano alle 28:59. */
+    private static final int NIGHT_SERVICE_END_HOUR = 5;
+
+    /**
+     * Tutte le corse che l'orario da' in viaggio adesso su una linea.
+     *
+     * <p>Prima se ne prendeva una sola. Andava bene per le linee di periferia,
+     * dove in viaggio ce n'e' una (la 990L passa ogni mezz'ora); sulla
+     * metropolitana, che non trasmette posizioni e ha un treno ogni tre minuti,
+     * si vedeva un treno solo su tutta la linea, in una direzione sola.
+     *
+     * <p>Di notte si guarda anche il giorno di servizio di ieri: dopo mezzanotte
+     * le corse ancora in viaggio gli appartengono (orari 24:xx, 25:xx).
+     *
+     * <p>Mai tre date insieme. La cache degli indici per-data tiene solo le due
+     * date accanto a quella appena costruita: chiedere ieri, oggi e domani nella
+     * stessa chiamata butta fuori ogni volta un indice e lo ricostruisce, tre
+     * secondi l'uno, a ogni poll di ogni client. Quindi: di notte ieri e oggi,
+     * di giorno solo oggi, e domani soltanto nell'ultima ora, quando una corsa
+     * "vicina a partire" puo' essere la prima del giorno dopo.
+     *
+     * <p>Se nessuna e' in viaggio resta la piu' vicina a partire, come prima: la
+     * mappa di una linea rada non deve svuotarsi fra una corsa e l'altra.
+     */
+    public List<SimulatedTrip> simulatedTripsInService(String line, String destination, Instant now) {
         String normalizedLine = normalizeText(line);
-        if (normalizedLine == null || limit <= 0) {
+        if (normalizedLine == null) {
+            return List.of();
+        }
+        String normalizedDestination = normalizeText(destination);
+        long nowEpochSeconds = now.getEpochSecond();
+        ZonedDateTime nowRome = ZonedDateTime.ofInstant(now, ROME_ZONE);
+        LocalDate today = nowRome.toLocalDate();
+
+        List<SimulatedTrip> candidates = new ArrayList<>();
+        if (nowRome.getHour() < NIGHT_SERVICE_END_HOUR) {
+            collectSimulatedTrips(candidates, today.minusDays(1), normalizedLine, normalizedDestination, nowEpochSeconds);
+        }
+        collectSimulatedTrips(candidates, today, normalizedLine, normalizedDestination, nowEpochSeconds);
+        if (candidates.isEmpty() && nowRome.getHour() == 23) {
+            collectSimulatedTrips(candidates, today.plusDays(1), normalizedLine, normalizedDestination, nowEpochSeconds);
+        }
+        if (candidates.isEmpty()) {
             return List.of();
         }
 
-        String normalizedDestination = normalizeText(destination);
-        ZonedDateTime nowRome = ZonedDateTime.ofInstant(now, ROME_ZONE);
-        List<SimulatedTrip> out = new ArrayList<>(limit);
-        collectSimulatedTrips(out, nowRome.toLocalDate(), normalizedLine, normalizedDestination, now.getEpochSecond());
-        if (out.size() < limit) {
-            collectSimulatedTrips(out, nowRome.toLocalDate().plusDays(1), normalizedLine, normalizedDestination, now.getEpochSecond());
+        // Una corsa, un mezzo: il codice "sim-" + tripId deve restare unico.
+        Map<String, SimulatedTrip> inService = new LinkedHashMap<>();
+        candidates.stream()
+                .filter(trip -> trip.activeAt(nowEpochSeconds))
+                .sorted(Comparator.comparingLong(SimulatedTrip::startEpochSeconds).thenComparing(SimulatedTrip::tripId))
+                .limit(MAX_SIMULATED_TRIPS_IN_SERVICE)
+                .forEach(trip -> inService.putIfAbsent(trip.tripId(), trip));
+        if (!inService.isEmpty()) {
+            return List.copyOf(inService.values());
         }
-        out.sort(Comparator
-                .comparingInt((SimulatedTrip trip) -> trip.activeAt(now.getEpochSecond()) ? 0 : 1)
-                .thenComparingLong(trip -> Math.abs(trip.startEpochSeconds() - now.getEpochSecond())));
-        if (out.size() > limit) {
-            return List.copyOf(out.subList(0, limit));
-        }
-        return List.copyOf(out);
+
+        return List.of(candidates.stream()
+                .min(Comparator.comparingLong(trip -> Math.abs(trip.startEpochSeconds() - nowEpochSeconds)))
+                .orElseThrow());
     }
 
     public Optional<SimulatedTrip> simulatedTripById(String tripId, Instant now) {

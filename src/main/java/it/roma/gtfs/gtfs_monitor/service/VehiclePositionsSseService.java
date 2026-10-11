@@ -239,7 +239,7 @@ public class VehiclePositionsSseService {
         if (subscription.linea() == null || subscription.linea().isBlank()) {
             return List.of();
         }
-        return simulateVehicles(subscription.linea(), subscription.normalizedDestination(), generatedAt, 1);
+        return simulateVehicles(subscription.linea(), subscription.normalizedDestination(), generatedAt);
     }
 
     private static String normalizedCapolinea(String capolinea, Map<String, String> cache) {
@@ -261,12 +261,13 @@ public class VehiclePositionsSseService {
         return normalized.isEmpty() ? null : normalized;
     }
 
-    private List<VehiclePositionDTO> simulateVehicles(String linea, String destination, Instant generatedAt, int limit) {
+    /** Come in VehiclePositionsService: un mezzo per ogni corsa che l'orario da' in viaggio. */
+    private List<VehiclePositionDTO> simulateVehicles(String linea, String destination, Instant generatedAt) {
         Instant now = generatedAt != null ? generatedAt : Instant.now();
         List<VehiclePositionDTO> out = new ArrayList<>();
-        List<GtfsIndexService.SimulatedTrip> simulatedTrips = gtfsIndexService.simulatedTrips(linea, destination, now, limit);
+        List<GtfsIndexService.SimulatedTrip> simulatedTrips = gtfsIndexService.simulatedTripsInService(linea, destination, now);
         if (simulatedTrips.isEmpty() && destination != null && !destination.isBlank()) {
-            simulatedTrips = gtfsIndexService.simulatedTrips(linea, null, now, limit);
+            simulatedTrips = gtfsIndexService.simulatedTripsInService(linea, null, now);
         }
 
         for (GtfsIndexService.SimulatedTrip simulated : simulatedTrips) {

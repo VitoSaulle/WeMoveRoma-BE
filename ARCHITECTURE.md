@@ -74,7 +74,7 @@ src/main/java/.../gtfsmonitor/
 ## REST API (`/api/v1`)
 
 ### Vehicles — `ApiVehiclesController`
-- `GET /vehicles` — lista mezzi (filtri: `linea`, `destination`, `limit`)
+- `GET /vehicles` — lista mezzi (filtri: `linea`, `destination`, `limit`). Se per la linea chiesta il feed non ha nessuna posizione (la metropolitana non ne trasmette, le linee di periferia a volte) risponde con le **corse che l'orario dà in viaggio adesso**, una per mezzo, con id `sim-<tripId>` e la posizione interpolata sul tracciato; se nessuna è in viaggio, con la più vicina a partire. Lo stesso vale per lo stream.
 - `GET /vehicles/stream` — **SSE** stream posizioni in tempo reale
 - `GET /vehicles/{vehicleId}/next-stops` — prossime fermate (scheduled + actual). Con id `sim-<tripId>` risponde con le fermate programmate della corsa simulata. *Nessun 404: un id sconosciuto dà `200` con lista vuota.*
 

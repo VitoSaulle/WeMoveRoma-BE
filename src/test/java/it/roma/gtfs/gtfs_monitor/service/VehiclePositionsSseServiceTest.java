@@ -59,13 +59,22 @@ class VehiclePositionsSseServiceTest {
                 S2,C2,Via Anastasio II,,41.9060,12.4405,,1,,0,
                 S3,C3,Staz.ne Metro Cipro,,41.9075,12.4462,,1,,0,
                 """);
+        // La 990L ha una corsa sola; la MEA e' la linea fitta: due treni per
+        // direzione a un quarto d'ora l'uno dall'altro, piu' una corsa che parte
+        // alle 24:10 del giorno di servizio, cioe' dopo mezzanotte.
         write("routes.txt", """
                 route_id,route_short_name,route_long_name
                 R990,990L,Linea 990L
+                RMEA,MEA,Metro A
                 """);
         write("trips.txt", """
                 route_id,service_id,trip_id,trip_headsign,trip_short_name,direction_id,block_id,shape_id,wheelchair_accessible,exceptional
                 R990,SVC1,0#3734-31,STAZ.NE METRO CIPRO (MA),,0,,SH990,1,0
+                RMEA,SVC1,A-AND-1,ANAGNINA (MA),,0,,SH990,1,0
+                RMEA,SVC1,A-AND-2,ANAGNINA (MA),,0,,SH990,1,0
+                RMEA,SVC1,A-RIT-1,BATTISTINI (MA),,1,,SH990,1,0
+                RMEA,SVC1,A-RIT-2,BATTISTINI (MA),,1,,SH990,1,0
+                RMEA,SVC1,A-NOTTE,ANAGNINA (MA),,0,,SH990,1,0
                 """);
         write("calendar_dates.txt", """
                 service_id,date,exception_type
@@ -83,6 +92,16 @@ class VehiclePositionsSseServiceTest {
                 0#3734-31,20:00:00,20:00:00,S1,1
                 0#3734-31,20:15:00,20:15:00,S2,2
                 0#3734-31,20:30:00,20:30:00,S3,3
+                A-AND-1,10:00:00,10:00:00,S1,1
+                A-AND-1,10:30:00,10:30:00,S3,2
+                A-AND-2,10:15:00,10:15:00,S1,1
+                A-AND-2,10:45:00,10:45:00,S3,2
+                A-RIT-1,10:05:00,10:05:00,S3,1
+                A-RIT-1,10:35:00,10:35:00,S1,2
+                A-RIT-2,10:20:00,10:20:00,S3,1
+                A-RIT-2,10:50:00,10:50:00,S1,2
+                A-NOTTE,24:10:00,24:10:00,S1,1
+                A-NOTTE,24:40:00,24:40:00,S3,2
                 """);
 
         GtfsProperties props = new GtfsProperties(
@@ -116,6 +135,54 @@ class VehiclePositionsSseServiceTest {
         Instant tooEarly = SERVICE_DATE.atTime(18, 0).atZone(ROME_ZONE).toInstant();
 
         assertTrue(simulateVehicles(LINE, DESTINATION, tooEarly).isEmpty());
+    }
+
+    @Test
+    void unaLineaFittaHaUnMezzoPerOgniCorsaInViaggio() throws Exception {
+        // Alle 10:25 sono in viaggio tutti e quattro i treni, due per direzione.
+        Instant now = SERVICE_DATE.atTime(10, 25).atZone(ROME_ZONE).toInstant();
+
+        List<VehiclePositionDTO> treni = simulateVehicles("MEA", null, now);
+
+        assertEquals(
+                List.of("sim-A-AND-1", "sim-A-RIT-1", "sim-A-AND-2", "sim-A-RIT-2"),
+                treni.stream().map(VehiclePositionDTO::getVeicolo).toList());
+        // E con la direzione scelta, solo quelli che ci vanno.
+        assertEquals(
+                List.of("sim-A-AND-1", "sim-A-AND-2"),
+                simulateVehicles("MEA", "ANAGNINA (MA)", now).stream().map(VehiclePositionDTO::getVeicolo).toList());
+    }
+
+    @Test
+    void leCorseNonAncoraPartiteNonSonoInViaggio() throws Exception {
+        // Alle 10:10 la seconda verso Anagnina (10:15) e la seconda verso
+        // Battistini (10:20) devono ancora partire: i treni sono due, non quattro.
+        Instant now = SERVICE_DATE.atTime(10, 10).atZone(ROME_ZONE).toInstant();
+
+        assertEquals(
+                List.of("sim-A-AND-1", "sim-A-RIT-1"),
+                simulateVehicles("MEA", null, now).stream().map(VehiclePositionDTO::getVeicolo).toList());
+    }
+
+    @Test
+    void seNessunaCorsaEInViaggioRestaLaPiuVicinaAPartire() throws Exception {
+        // Alle 19:40 la 990L non ha corse in viaggio, ma una parte fra venti
+        // minuti: la mappa non deve svuotarsi fra una corsa e l'altra.
+        Instant now = SERVICE_DATE.atTime(19, 40).atZone(ROME_ZONE).toInstant();
+
+        List<VehiclePositionDTO> vehicles = simulateVehicles(LINE, null, now);
+
+        assertEquals(List.of(VEHICLE_ID), vehicles.stream().map(VehiclePositionDTO::getVeicolo).toList());
+    }
+
+    @Test
+    void dopoMezzanotteContaIlGiornoDiServizioDiIeri() throws Exception {
+        // 00:20 dell'8 marzo: la corsa delle "24:10" appartiene ancora al 7.
+        Instant now = SERVICE_DATE.plusDays(1).atTime(0, 20).atZone(ROME_ZONE).toInstant();
+
+        assertEquals(
+                List.of("sim-A-NOTTE"),
+                simulateVehicles("MEA", null, now).stream().map(VehiclePositionDTO::getVeicolo).toList());
     }
 
     @Test
@@ -153,9 +220,9 @@ class VehiclePositionsSseServiceTest {
     @SuppressWarnings("unchecked")
     private List<VehiclePositionDTO> simulateVehicles(String line, String destination, Instant now) throws Exception {
         Method simulateVehicles = VehiclePositionsSseService.class.getDeclaredMethod(
-                "simulateVehicles", String.class, String.class, Instant.class, int.class);
+                "simulateVehicles", String.class, String.class, Instant.class);
         simulateVehicles.setAccessible(true);
-        return (List<VehiclePositionDTO>) simulateVehicles.invoke(sseService, line, destination, now, 1);
+        return (List<VehiclePositionDTO>) simulateVehicles.invoke(sseService, line, destination, now);
     }
 
     @SuppressWarnings("unchecked")

@@ -72,7 +72,8 @@ public class VehiclePositionsService {
         if (linea == null || linea.isBlank()) {
             return List.of();
         }
-        return simulateVehicles(linea, capolinea, 1);
+        List<VehiclePositionDTO> simulated = simulateVehicles(linea, capolinea);
+        return max > 0 && simulated.size() > max ? simulated.subList(0, max) : simulated;
     }
 
     public Instant lastSnapshotAt() {
@@ -280,14 +281,15 @@ public class VehiclePositionsService {
         return normalized.isEmpty() ? null : normalized;
     }
 
-    private List<VehiclePositionDTO> simulateVehicles(String linea, String capolinea, int limit) {
+    /** Linea senza posizioni nel feed: un mezzo per ogni corsa che l'orario da' in viaggio. */
+    private List<VehiclePositionDTO> simulateVehicles(String linea, String capolinea) {
         long nowEpochSeconds = Instant.now().getEpochSecond();
         String timestamp = ISO_ROME.format(Instant.ofEpochSecond(nowEpochSeconds));
         List<VehiclePositionDTO> out = new ArrayList<>();
         Instant now = Instant.ofEpochSecond(nowEpochSeconds);
-        List<GtfsIndexService.SimulatedTrip> simulatedTrips = indexService.simulatedTrips(linea, capolinea, now, limit);
+        List<GtfsIndexService.SimulatedTrip> simulatedTrips = indexService.simulatedTripsInService(linea, capolinea, now);
         if (simulatedTrips.isEmpty() && capolinea != null && !capolinea.isBlank()) {
-            simulatedTrips = indexService.simulatedTrips(linea, null, now, limit);
+            simulatedTrips = indexService.simulatedTripsInService(linea, null, now);
         }
 
         for (GtfsIndexService.SimulatedTrip simulated : simulatedTrips) {
