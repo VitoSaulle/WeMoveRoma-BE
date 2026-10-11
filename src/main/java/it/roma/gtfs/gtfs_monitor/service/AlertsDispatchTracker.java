@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Map;
@@ -55,18 +56,41 @@ public class AlertsDispatchTracker {
     }
 
     /**
-     * @return true se l'id non era ancora stato visto (= "nuovo" da notificare).
-     *         Marca lo stato e persiste su file.
+     * @return true se per questo id una push e' gia' partita (o non va piu'
+     *         spedita). Non marca niente: si marca con {@link #markSent} solo
+     *         dopo un invio riuscito, cosi' un invio fallito si ritenta.
      */
-    public boolean markIfNew(String id) {
-        if (id == null || id.isBlank()) return false;
+    public boolean isSent(String id) {
+        if (id == null || id.isBlank()) return true;
         lock.lock();
         try {
-            if (!seen.add(id)) {
-                return false;
+            return seen.contains(id);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Marca l'id come gia' notificato e persiste su file. */
+    public void markSent(String id) {
+        markAllSent(id == null ? Set.of() : Set.of(id));
+    }
+
+    /**
+     * Marca piu' id in un colpo solo, con una sola scrittura su file. Serve al
+     * primo giro dopo l'avvio, che segna lo stato attuale senza spedire.
+     */
+    public void markAllSent(Collection<String> ids) {
+        lock.lock();
+        try {
+            boolean changed = false;
+            for (String id : ids) {
+                if (id != null && !id.isBlank()) {
+                    changed |= seen.add(id);
+                }
             }
-            persistInternal();
-            return true;
+            if (changed) {
+                persistInternal();
+            }
         } finally {
             lock.unlock();
         }

@@ -47,6 +47,10 @@ final class FeedStub {
         body.set(feed.toByteArray());
     }
 
+    void serve(byte[] raw) {
+        body.set(raw);
+    }
+
     static GtfsRealtime.FeedMessage.Builder feed() {
         return GtfsRealtime.FeedMessage.newBuilder()
                 .setHeader(GtfsRealtime.FeedHeader.newBuilder().setGtfsRealtimeVersion("2.0"));

@@ -42,6 +42,15 @@ public class FcmDispatcherService {
     }
 
     /**
+     * Se le push possono partire davvero. Con FCM spento {@link #sendToTopic}
+     * restituisce false come per un errore: chi marca le notifiche solo dopo un
+     * invio riuscito deve poter distinguere "spento" da "fallito".
+     */
+    public boolean isEnabled() {
+        return enabled && !FirebaseApp.getApps().isEmpty();
+    }
+
+    /**
      * @return true se il messaggio e' partito; false se FCM e' disabilitato o
      *         se la libreria ha sollevato un'eccezione (loggata e inghiottita).
      */

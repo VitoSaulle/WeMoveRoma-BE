@@ -224,11 +224,18 @@ public class StrikeService {
         return out;
     }
 
+    /**
+     * Spedisce gli scioperi non ancora notificati. Lo sciopero si marca solo
+     * <b>dopo</b> un invio riuscito: prima si marcava e poi si spediva, e una
+     * push fallita non veniva ritentata mai piu'. Ora si ritenta al refresh
+     * successivo.
+     */
     private void dispatchNew(List<StrikeDTO> strikes) {
+        if (!fcmDispatcher.isEnabled()) return;
         int sent = 0;
         for (StrikeDTO s : strikes) {
             if (s.getId() == null) continue;
-            if (!dispatchTracker.markIfNew(s.getId())) continue;
+            if (dispatchTracker.isSent(s.getId())) continue;
             String title = buildTitle(s);
             String body = buildBody(s);
             Map<String, String> data = new HashMap<>();
@@ -240,7 +247,10 @@ public class StrikeService {
             if (s.getSettore() != null) data.put("settore", s.getSettore());
             data.put("deeplink", "wemoveroma://alerts?tab=strikes");
             if (fcmDispatcher.sendToTopic(fcmDispatcher.topicStrikes(), title, body, data)) {
+                dispatchTracker.markSent(s.getId());
                 sent++;
+            } else {
+                log.warn("[Strikes] push per sciopero {} fallita, si ritenta al prossimo refresh.", s.getId());
             }
         }
         if (sent > 0) log.info("[Strikes] dispatched {} push.", sent);

@@ -38,6 +38,11 @@ public class ServiceAlertsService {
     private final AtomicReference<CacheEntry<List<ServiceAlertDTO>>> cacheRef =
             new AtomicReference<>(CacheEntry.empty());
     private final Object refreshLock = new Object();
+
+    /** Tentativi di push falliti per chiave di dispatch, solo in memoria. */
+    private final Map<String, Integer> failedSends = new java.util.concurrent.ConcurrentHashMap<>();
+    /** Dopo quanti invii falliti di fila un alert si abbandona. */
+    static final int MAX_SEND_ATTEMPTS = 3;
     private static final ZoneId ROME = ZoneId.of("Europe/Rome");
 
     /**
@@ -233,19 +238,27 @@ public class ServiceAlertsService {
 
     /**
      * Per ogni alert nello snapshot fresco: se filtra (severity) e non e' mai
-     * stato visto (AlertsDispatchTracker), invia una push al topic FCM.
+     * stato notificato (AlertsDispatchTracker), invia una push al topic FCM.
      * Backstop {@code maxAlertsPerRefresh}: se ci sono N alert nuovi in un colpo
-     * (es. primo run dopo deploy) spediamo solo i primi N evitando flood.
+     * (es. primo run dopo deploy) proviamo solo i primi N evitando flood.
+     *
+     * <p>L'alert si marca come notificato solo <b>dopo</b> un invio riuscito:
+     * prima si marcava e poi si spediva, e una push fallita (FCM giu', rete)
+     * non veniva ritentata mai piu'. Un alert che fallisce
+     * {@link #MAX_SEND_ATTEMPTS} volte di fila si abbandona, per non occupare
+     * per sempre i posti del backstop.
      */
     private void dispatchNewAlertsToFcm(List<ServiceAlertDTO> fresh) {
         if (fresh == null || fresh.isEmpty()) return;
+        if (!fcmDispatcher.isEnabled()) return;
         Set<String> wanted = parseSeverities(alertSeveritiesCsv);
+        int attempts = 0;
         int sent = 0;
         // Dedup per id base nello stesso ciclo: lo stesso alert con piu' active
         // periods viene espanso in piu' DTO ma vogliamo una sola push.
         Set<String> sentThisCycle = new HashSet<>();
         for (ServiceAlertDTO dto : fresh) {
-            if (sent >= maxAlertsPerRefresh) break;
+            if (attempts >= maxAlertsPerRefresh) break;
             String id = dto.getId();
             if (id == null || id.isBlank()) continue;
             if (!sentThisCycle.add(id)) continue;
@@ -256,15 +269,22 @@ public class ServiceAlertsService {
             // Key dispatch: id+inizio_epoch — un alert con stesso id ma diverso
             // active period e' un evento ri-comunicabile.
             String dispatchKey = id + "@" + (dto.getInizio() == null ? "" : dto.getInizio().getEpochSecond());
-            if (!dispatchTracker.markIfNew(dispatchKey)) {
+            if (dispatchTracker.isSent(dispatchKey)) {
                 continue;
             }
 
             String title = buildPushTitle(dto);
             String body  = buildPushBody(dto);
             Map<String, String> data = buildPushData(dto);
+            attempts++;
             if (fcmDispatcher.sendToTopic(fcmDispatcher.topicAlerts(), title, body, data)) {
+                dispatchTracker.markSent(dispatchKey);
+                failedSends.remove(dispatchKey);
                 sent++;
+            } else if (failedSends.merge(dispatchKey, 1, Integer::sum) >= MAX_SEND_ATTEMPTS) {
+                log.warn("[ServiceAlerts] push per {} fallita {} volte, la abbandono.", dispatchKey, MAX_SEND_ATTEMPTS);
+                dispatchTracker.markSent(dispatchKey);
+                failedSends.remove(dispatchKey);
             }
         }
         if (sent > 0) {

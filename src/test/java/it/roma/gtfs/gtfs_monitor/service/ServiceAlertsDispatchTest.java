@@ -41,7 +41,7 @@ class ServiceAlertsDispatchTest {
         fcm = mock(FcmDispatcherService.class);
         tracker = mock(AlertsDispatchTracker.class);
         when(fcm.topicAlerts()).thenReturn("wemoveroma-alerts");
-        when(tracker.markIfNew(anyString())).thenReturn(true);
+        when(fcm.isEnabled()).thenReturn(true);
         svc = new ServiceAlertsService(FeedStub.props(60_000), stub.webClient, fcm, tracker);
         ReflectionTestUtils.setField(svc, "alertSeveritiesCsv", "SEVERE");
         ReflectionTestUtils.setField(svc, "minRoutesForPush", 5);
@@ -73,5 +73,55 @@ class ServiceAlertsDispatchTest {
 
         verify(fcm, times(1)).sendToTopic(anyString(), anyString(), anyString(), anyMap());
         assertThat(dentroIlLock).isFalse();
+    }
+
+    @Test
+    @DisplayName("una push riuscita marca l'avviso, una fallita no e si ritenta al giro dopo")
+    void marcaSoloDopoInvioRiuscito() {
+        stub.serve(FeedStub.feed().addEntity(sospensione("A1")).build());
+        when(fcm.sendToTopic(anyString(), anyString(), anyString(), any())).thenReturn(false, true);
+
+        svc.scheduledRefresh();
+        verify(tracker, never()).markSent(anyString());
+
+        svc.scheduledRefresh();
+        verify(fcm, times(2)).sendToTopic(anyString(), anyString(), anyString(), anyMap());
+        verify(tracker, times(1)).markSent("A1@");
+    }
+
+    @Test
+    @DisplayName("un avviso gia' notificato non riparte")
+    void giaNotificatoNonRiparte() {
+        stub.serve(FeedStub.feed().addEntity(sospensione("A1")).build());
+        when(tracker.isSent("A1@")).thenReturn(true);
+
+        svc.scheduledRefresh();
+
+        verify(fcm, never()).sendToTopic(anyString(), anyString(), anyString(), anyMap());
+    }
+
+    @Test
+    @DisplayName("una push che fallisce sempre si abbandona dopo qualche giro")
+    void pushSempreFallitaSiAbbandona() {
+        stub.serve(FeedStub.feed().addEntity(sospensione("A1")).build());
+        when(fcm.sendToTopic(anyString(), anyString(), anyString(), any())).thenReturn(false);
+
+        for (int i = 0; i < ServiceAlertsService.MAX_SEND_ATTEMPTS; i++) {
+            svc.scheduledRefresh();
+        }
+
+        verify(tracker, times(1)).markSent("A1@");
+    }
+
+    @Test
+    @DisplayName("con FCM spento non si tenta e non si marca niente")
+    void fcmSpento() {
+        stub.serve(FeedStub.feed().addEntity(sospensione("A1")).build());
+        when(fcm.isEnabled()).thenReturn(false);
+
+        svc.scheduledRefresh();
+
+        verify(fcm, never()).sendToTopic(anyString(), anyString(), anyString(), anyMap());
+        verify(tracker, never()).markSent(anyString());
     }
 }

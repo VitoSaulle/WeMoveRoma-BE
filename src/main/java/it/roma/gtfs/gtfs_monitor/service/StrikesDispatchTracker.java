@@ -10,6 +10,7 @@ import org.springframework.stereotype.Component;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Collection;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
@@ -45,13 +46,31 @@ public class StrikesDispatchTracker {
         }
     }
 
-    public boolean markIfNew(String id) {
-        if (id == null || id.isBlank()) return false;
+    /** Come {@link AlertsDispatchTracker#isSent}: controlla senza marcare. */
+    public boolean isSent(String id) {
+        if (id == null || id.isBlank()) return true;
         lock.lock();
         try {
-            if (!seen.add(id)) return false;
-            persistInternal();
-            return true;
+            return seen.contains(id);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** Da chiamare solo dopo un invio riuscito. */
+    public void markSent(String id) {
+        markAllSent(id == null ? Set.of() : Set.of(id));
+    }
+
+    /** Marca piu' id con una sola scrittura su file (warmup senza push). */
+    public void markAllSent(Collection<String> ids) {
+        lock.lock();
+        try {
+            boolean changed = false;
+            for (String id : ids) {
+                if (id != null && !id.isBlank()) changed |= seen.add(id);
+            }
+            if (changed) persistInternal();
         } finally {
             lock.unlock();
         }
