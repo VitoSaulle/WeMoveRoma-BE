@@ -1,8 +1,8 @@
 package it.roma.gtfs.gtfs_monitor.service;
 
 import it.roma.gtfs.gtfs_monitor.model.dto.GeocodeSearchResultDTO;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 import org.springframework.web.reactive.function.client.WebClientResponseException;
 import org.springframework.web.reactive.function.client.WebClient;
@@ -11,12 +11,11 @@ import org.springframework.web.util.UriBuilder;
 import java.text.Normalizer;
 import java.time.Duration;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
 
 @Slf4j
 @Service
-@RequiredArgsConstructor
 public class GeocodeSearchService {
     // Roma + cintura (municipi e comuni limitrofi utili) per rendere la ricerca più precisa/reattiva.
     private static final double ROME_MIN_LON = 12.20;
@@ -25,6 +24,16 @@ public class GeocodeSearchService {
     private static final double ROME_MAX_LAT = 42.15;
     private static final long SEARCH_CACHE_TTL_MILLIS = 30_000L;
     private static final long UPSTREAM_CACHE_TTL_MILLIS = 120_000L;
+    /*
+     * Tetti delle due cache. Prima erano mappe senza limite: l'autocomplete
+     * chiede a ogni tasto, e la chiave contiene la posizione arrotondata a
+     * ~100 m, quindi le chiavi diverse crescevano senza fine e, tenute come
+     * ripiego anche scadute, restavano in memoria per sempre. Oltre il tetto
+     * esce quella usata meno di recente: le ricerche frequenti restano, e con
+     * loro il ripiego quando il servizio non risponde.
+     */
+    static final int MAX_SEARCH_CACHE_ENTRIES = 2_000;
+    static final int MAX_UPSTREAM_CACHE_ENTRIES = 1_000;
 
     // Comuni della cintura accettati anche se non contengono "roma" nella label/city.
     private static final Set<String> ROME_METRO_TOWNS = Set.of(
@@ -37,9 +46,39 @@ public class GeocodeSearchService {
     );
 
     private final WebClient webClient;
-    private final NominatimGate nominatimGate;
-    private final Map<String, TimedValue<List<GeocodeSearchResultDTO>>> searchCache = new ConcurrentHashMap<>();
-    private final Map<String, TimedValue<List<Map<String, Object>>>> upstreamCache = new ConcurrentHashMap<>();
+    private final UpstreamGate nominatimGate;
+    private final LongSupplier clock;
+    private final Map<String, TimedValue<List<GeocodeSearchResultDTO>>> searchCache = boundedLru(MAX_SEARCH_CACHE_ENTRIES);
+    private final Map<String, TimedValue<List<Map<String, Object>>>> upstreamCache = boundedLru(MAX_UPSTREAM_CACHE_ENTRIES);
+
+    @Autowired
+    public GeocodeSearchService(WebClient webClient, NominatimGate nominatimGate) {
+        this(webClient, nominatimGate, System::currentTimeMillis);
+    }
+
+    GeocodeSearchService(WebClient webClient, UpstreamGate nominatimGate, LongSupplier clock) {
+        this.webClient = webClient;
+        this.nominatimGate = nominatimGate;
+        this.clock = clock;
+    }
+
+    /** Una mappa che tiene al massimo {@code maxEntries} voci e lascia andare quella usata meno di recente. */
+    private static <V> Map<String, V> boundedLru(int maxEntries) {
+        return Collections.synchronizedMap(new LinkedHashMap<>(16, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<String, V> eldest) {
+                return size() > maxEntries;
+            }
+        });
+    }
+
+    int searchCacheSize() {
+        return searchCache.size();
+    }
+
+    int upstreamCacheSize() {
+        return upstreamCache.size();
+    }
 
     @SuppressWarnings("unchecked")
     public List<GeocodeSearchResultDTO> search(String query, Integer limit, Double biasLat, Double biasLon) {
@@ -101,7 +140,7 @@ public class GeocodeSearchService {
                     .map(v -> v.result)
                     .limit(cappedLimit)
                     .toList();
-            searchCache.put(cacheKey, new TimedValue<>(results, System.currentTimeMillis()));
+            searchCache.put(cacheKey, new TimedValue<>(results, clock.getAsLong()));
             return results;
         } catch (Exception e) {
             // Mai il testo cercato nei log, qui e nelle fetch sotto: e' spesso un
@@ -243,7 +282,7 @@ public class GeocodeSearchService {
                     .block(Duration.ofSeconds(6));
             List<Map<String, Object>> rows = photonFeaturesToRows((Map<String, Object>) payload);
             List<Map<String, Object>> safeRows = List.copyOf(rows);
-            upstreamCache.put(cacheKey, new TimedValue<>(safeRows, System.currentTimeMillis()));
+            upstreamCache.put(cacheKey, new TimedValue<>(safeRows, clock.getAsLong()));
             return new VariantFetch(safeRows, false);
         } catch (WebClientResponseException.TooManyRequests e) {
             List<Map<String, Object>> stale = getCached(upstreamCache, cacheKey, Long.MAX_VALUE);
@@ -396,7 +435,7 @@ public class GeocodeSearchService {
                     .block(Duration.ofSeconds(8));
             nominatimGate.succeeded();
             List<Map<String, Object>> safePayload = payload == null ? List.of() : List.copyOf(payload);
-            upstreamCache.put(cacheKey, new TimedValue<>(safePayload, System.currentTimeMillis()));
+            upstreamCache.put(cacheKey, new TimedValue<>(safePayload, clock.getAsLong()));
             return new VariantFetch(safePayload, false);
         } catch (Exception e) {
             /*
@@ -906,10 +945,10 @@ public class GeocodeSearchService {
         return String.format(Locale.ROOT, "%.3f", value);
     }
 
-    private static <T> T getCached(Map<String, TimedValue<T>> cache, String key, long ttlMillis) {
+    private <T> T getCached(Map<String, TimedValue<T>> cache, String key, long ttlMillis) {
         TimedValue<T> timed = cache.get(key);
         if (timed == null || timed.value() == null) return null;
-        long age = System.currentTimeMillis() - timed.loadedAtMillis();
+        long age = clock.getAsLong() - timed.loadedAtMillis();
         if (age > ttlMillis) return null;
         return timed.value();
     }
