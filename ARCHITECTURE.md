@@ -86,7 +86,7 @@ src/main/java/.../gtfsmonitor/
 ### Stops — `ApiStopsController`
 - `GET /stops` — lista (bbox o totale)
 - `GET /stops/search` — ricerca per nome
-- `GET /stops/{stopId}/arrivals` — arrivi previsti — **404** se la fermata non esiste, **503** se gli indici non sono ancora pronti
+- `GET /stops/{stopId}/arrivals?limit=&line=` — arrivi previsti — **404** se la fermata non esiste, **503** se gli indici non sono ancora pronti. Con `line` i prossimi arrivi di quella linea (fino a metà del limite) entrano comunque, anche se in ordine di tempo verrebbero dopo quelli di altre linee: lo usa la scheda della fermata di un itinerario, dove si aspetta *quel* bus
 
 `/stops` e `/stops/search` usano `GtfsIndexService.dataVersion()` come `generatedAt` (non `Instant.now()`): è ciò che rende utilizzabile l'ETag, vedi [Prestazioni](#prestazioni-e-caching).
 
@@ -105,7 +105,7 @@ src/main/java/.../gtfsmonitor/
 > nessuna scansione aggiuntiva di `stop_times.txt`.
 
 ### Journey planner — `ApiJourneyController`
-- `GET /journey/plan` — pianificazione multimodale via OTP (`fromLat`, `fromLon`, `toLat`, `toLon`, `numItineraries`, `timeMode`, `when`, `modes`)
+- `GET /journey/plan` — pianificazione multimodale via OTP (`fromLat`, `fromLon`, `toLat`, `toLon`, `numItineraries`, `timeMode`, `when`, `modes`). Ogni fermata di una tratta porta `stopId`, la palina del GTFS (lo stesso codice di `/stops`), quando OTP e il GTFS in memoria concordano su quale sia e dove stia (entro 150 m); `null` per le stazioni dei treni regionali, che vengono da un altro feed. Prima le fermate arrivavano solo con nome e coordinate, e il client le ritrovava cercando la palina più vicina con un nome simile
 
 Il `JourneyPlannerService` interroga OTP (GraphQL `planConnection`) e poi **post-processa** i risultati:
 

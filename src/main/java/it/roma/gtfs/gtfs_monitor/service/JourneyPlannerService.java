@@ -27,6 +27,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -69,7 +70,7 @@ public class JourneyPlannerService {
                       legGeometry { points }
                       stopCalls {
                         stopLocation {
-                          ... on Stop { name lat lon }
+                          ... on Stop { gtfsId name lat lon }
                         }
                       }
                       start { scheduledTime estimated { time } }
@@ -83,6 +84,13 @@ public class JourneyPlannerService {
             """;
 
     private final WebClient webClient;
+    private final GtfsIndexService gtfsIndexService;
+
+    /**
+     * Oltre questa distanza fra dove il planner mette una fermata e dove il GTFS
+     * mette la palina con lo stesso codice, non e' la stessa fermata: vedi palina.
+     */
+    static final double METRI_STESSA_PALINA = 150;
 
     @Value("${journey.otp.enabled:false}")
     private boolean otpEnabled;
@@ -442,7 +450,7 @@ public class JourneyPlannerService {
             if (leg.get("legGeometry") instanceof Map<?, ?> geometry) {
                 geometryPoints = toStringOrNull(geometry.get("points"));
             }
-            List<JourneyLegStopDTO> legStops = extractLegStops(leg.get("stopCalls"));
+            List<JourneyLegStopDTO> legStops = extractLegStops(leg.get("stopCalls"), gtfsIndexService::stopByIdOrNull);
 
             legs.add(new JourneyLegDTO(
                     normalizeMode(mode),
@@ -489,8 +497,38 @@ public class JourneyPlannerService {
         );
     }
 
+    /**
+     * La palina del GTFS che corrisponde a una fermata del planner, o null.
+     *
+     * Il planner (OTP) identifica le fermate come "feed:stop_id". Il codice vale
+     * solo se il GTFS in memoria ha quella palina E la mette nello stesso posto:
+     *  - le stazioni dei treni regionali vengono da un altro feed (NeTEx
+     *    Trenitalia) e nel GTFS di Roma non ci sono;
+     *  - due feed possono usare lo stesso codice per fermate diverse: la
+     *    distanza le distingue senza dover sapere come si chiamano i feed;
+     *  - il grafo del planner si ricostruisce un paio di volte al giorno, il GTFS
+     *    si aggiorna da solo: nel mezzo una palina puo' essersi spostata di
+     *    qualche decina di metri (ottobre 2026: 31 in tre giorni, al massimo 44 m)
+     *    e resta lei; oltre i 150 metri e' piu' prudente non fidarsi.
+     * Senza codice chi legge torna a cercare la fermata per nome e posizione,
+     * come faceva prima.
+     */
+    static String palina(String gtfsId, double lat, double lon, Function<String, GtfsIndexService.Stop> paline) {
+        if (gtfsId == null || gtfsId.isBlank()) {
+            return null;
+        }
+        int dopoIlFeed = gtfsId.indexOf(':');
+        String stopId = dopoIlFeed >= 0 ? gtfsId.substring(dopoIlFeed + 1) : gtfsId;
+        GtfsIndexService.Stop palina = stopId.isBlank() ? null : paline.apply(stopId);
+        if (palina == null || palina.lat() == null || palina.lon() == null) {
+            return null;
+        }
+        double distanza = GtfsIndexService.metri(new double[]{lon, lat}, new double[]{palina.lon(), palina.lat()});
+        return distanza <= METRI_STESSA_PALINA ? palina.id() : null;
+    }
+
     @SuppressWarnings("unchecked")
-    private static List<JourneyLegStopDTO> extractLegStops(Object rawStopCalls) {
+    static List<JourneyLegStopDTO> extractLegStops(Object rawStopCalls, Function<String, GtfsIndexService.Stop> paline) {
         if (!(rawStopCalls instanceof List<?> list) || list.isEmpty()) {
             return List.of();
         }
@@ -508,7 +546,7 @@ public class JourneyPlannerService {
             String key = name + "|" + lat + "|" + lon;
             if (key.equals(lastKey)) continue;
             lastKey = key;
-            out.add(new JourneyLegStopDTO(name, lat, lon));
+            out.add(new JourneyLegStopDTO(name, lat, lon, palina(toStringOrNull(stop.get("gtfsId")), lat, lon, paline)));
         }
         return out;
     }

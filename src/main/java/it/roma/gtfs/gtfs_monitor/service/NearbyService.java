@@ -196,6 +196,17 @@ public class NearbyService {
      *         arrivi resta 200 con {@code arrivals} vuoto.
      */
     public NearbyStopDTO stopArrivals(String stopId, Integer limitArrivalsPerStop) {
+        return stopArrivals(stopId, limitArrivalsPerStop, null);
+    }
+
+    /**
+     * Come sopra, ma con una linea che non deve restare fuori. Chi guarda la
+     * fermata di un itinerario aspetta QUEL bus: i primi arrivi in ordine di
+     * tempo, in una fermata con venti linee, possono essere tutti di altre
+     * (misurato in produzione, ottobre 2026: 3 fermate su 40). Con `linea` i suoi
+     * prossimi arrivi entrano comunque, e gli altri riempiono il resto.
+     */
+    public NearbyStopDTO stopArrivals(String stopId, Integer limitArrivalsPerStop, String linea) {
         if (stopId == null || stopId.isBlank()) {
             throw new IllegalArgumentException("stopId: obbligatorio");
         }
@@ -220,7 +231,8 @@ public class NearbyService {
                 .filter(v -> v.getVeicolo() != null && !v.getVeicolo().isBlank())
                 .collect(Collectors.toMap(VehiclePositionDTO::getVeicolo, v -> v, (a, b) -> a));
 
-        return toNearbyStop(new StopDistance(stop, 0), updatesForStop, vehiclesByTripId, vehiclesById, arrivalsLimit, now, false);
+        String richiesta = linea == null || linea.isBlank() ? null : linea.trim();
+        return toNearbyStop(new StopDistance(stop, 0), updatesForStop, vehiclesByTripId, vehiclesById, arrivalsLimit, now, false, richiesta);
     }
 
     public NearbyResponseDTO nearby(double lat, double lon, Integer radiusMeters, Integer limitStops, Integer limitArrivalsPerStop) {
@@ -264,16 +276,32 @@ public class NearbyService {
             long now,
             boolean includeDistance
     ) {
+        return toNearbyStop(sd, updates, vehiclesByTripId, vehiclesById, arrivalsLimit, now, includeDistance, null);
+    }
+
+    private NearbyStopDTO toNearbyStop(
+            StopDistance sd,
+            List<TripUpdateDTO> updates,
+            Map<String, VehiclePositionDTO> vehiclesByTripId,
+            Map<String, VehiclePositionDTO> vehiclesById,
+            int arrivalsLimit,
+            long now,
+            boolean includeDistance,
+            String linea
+    ) {
         List<NearbyArrivalDTO> liveArrivals = updates.stream()
                 .map(u -> toArrival(u, vehiclesByTripId, vehiclesById, now))
                 .filter(Objects::nonNull)
                 .toList();
         List<NearbyArrivalDTO> scheduledArrivals = gtfsIndexService
-                .scheduledArrivalsForStop(sd.stop.id(), Instant.ofEpochMilli(now), 180, arrivalsLimit * 3)
+                // Con una linea richiesta si guardano tutte le corse delle tre ore: la sua
+                // prossima puo' venire dopo decine di corse di altre linee.
+                .scheduledArrivalsForStop(sd.stop.id(), Instant.ofEpochMilli(now), 180,
+                        linea == null ? arrivalsLimit * 3 : PROGRAMMATI_CON_LINEA)
                 .stream()
                 .map(this::toScheduledArrival)
                 .toList();
-        List<NearbyArrivalDTO> arrivals = mergeArrivals(liveArrivals, scheduledArrivals, arrivalsLimit);
+        List<NearbyArrivalDTO> arrivals = conLaLinea(mergeArrivals(liveArrivals, scheduledArrivals), linea, arrivalsLimit);
 
         // Le linee servite non dipendono dagli arrivi del momento: di notte gli
         // arrivi sono vuoti ma la fermata resta servita da quelle linee (e i
@@ -339,10 +367,41 @@ public class NearbyService {
         );
     }
 
+    /** Quante corse programmate leggere quando si cerca una linea in particolare. */
+    private static final int PROGRAMMATI_CON_LINEA = 600;
+
+    /**
+     * Taglia gli arrivi, gia' in ordine di tempo, al limite. Con una linea
+     * richiesta i suoi arrivi hanno fino a meta' dei posti e non possono restarne
+     * fuori; gli altri posti vanno ai piu' vicini nel tempo, di qualunque linea.
+     * Il risultato resta in ordine di tempo.
+     */
+    static List<NearbyArrivalDTO> conLaLinea(List<NearbyArrivalDTO> inOrdine, String linea, int limite) {
+        if (linea == null || linea.isBlank() || inOrdine.size() <= limite) {
+            return inOrdine.stream().limit(limite).toList();
+        }
+        int perLaLinea = Math.max(1, limite / 2);
+        Set<NearbyArrivalDTO> scelti = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (NearbyArrivalDTO a : inOrdine) {
+            if (scelti.size() == perLaLinea) {
+                break;
+            }
+            if (a.line() != null && a.line().trim().equalsIgnoreCase(linea.trim())) {
+                scelti.add(a);
+            }
+        }
+        for (NearbyArrivalDTO a : inOrdine) {
+            if (scelti.size() == limite) {
+                break;
+            }
+            scelti.add(a);
+        }
+        return inOrdine.stream().filter(scelti::contains).toList();
+    }
+
     private List<NearbyArrivalDTO> mergeArrivals(
             List<NearbyArrivalDTO> liveArrivals,
-            List<NearbyArrivalDTO> scheduledArrivals,
-            int arrivalsLimit
+            List<NearbyArrivalDTO> scheduledArrivals
     ) {
         Set<String> liveTripIds = liveArrivals.stream()
                 .map(NearbyArrivalDTO::tripId)
@@ -360,7 +419,6 @@ public class NearbyService {
 
         return merged.stream()
                 .sorted(Comparator.comparingInt(NearbyArrivalDTO::etaMinutes))
-                .limit(arrivalsLimit)
                 .toList();
     }
 

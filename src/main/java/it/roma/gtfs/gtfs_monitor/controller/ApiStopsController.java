@@ -56,11 +56,13 @@ public class ApiStopsController {
     @GetMapping("/{stopId}/arrivals")
     public NearbyStopDTO getStopArrivals(
             @PathVariable String stopId,
-            @RequestParam(required = false) Integer limit
+            @RequestParam(required = false) Integer limit,
+            /** La linea che si sta aspettando: i suoi prossimi arrivi entrano comunque. Vedi NearbyService. */
+            @RequestParam(required = false) String line
     ) {
-        log.debug("GET /api/v1/stops/{}/arrivals limit={}", stopId, limit);
+        log.debug("GET /api/v1/stops/{}/arrivals limit={} line={}", stopId, limit, line);
         requireStaticData();
-        return nearbyService.stopArrivals(stopId, limit);
+        return nearbyService.stopArrivals(stopId, limit, line);
     }
 
     /** Con gli indici ancora vuoti nessun id esiste: 503, non 404. */
