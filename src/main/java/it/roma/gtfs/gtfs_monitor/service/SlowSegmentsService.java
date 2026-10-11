@@ -205,11 +205,6 @@ public class SlowSegmentsService {
             return Optional.empty();
         }
 
-        if (!versioneGtfs.equals(versioneGeometrie)) {
-            geometrie.clear();
-            versioneGeometrie = versioneGtfs;
-        }
-        LocalDate oggi = PunctualityService.oggi();
         List<ApiSlowSegmentsDTO.Segment> segmenti = new ArrayList<>();
         for (Tratto t : periodo.tratti()) {
             GtfsIndexService.Stop da = gtfs.stopByIdOrNull(t.da());
@@ -217,16 +212,8 @@ public class SlowSegmentsService {
             if (da == null || a == null || da.lat() == null || a.lat() == null) {
                 continue; // fermata non piu' nel GTFS: non si saprebbe dove disegnarla
             }
-            List<double[]> strada = geometrie.computeIfAbsent(t.da() + "|" + t.a(), k -> {
-                List<double[]> s = gtfs.shapeBetweenStops(t.da(), t.a(), oggi);
-                return s.isEmpty()
-                        ? List.of(new double[]{da.lon(), da.lat()}, new double[]{a.lon(), a.lat()})
-                        : s;
-            });
-            double lunghezza = 0;
-            for (int i = 1; i < strada.size(); i++) {
-                lunghezza += GtfsIndexService.metri(strada.get(i - 1), strada.get(i));
-            }
+            List<double[]> strada = strada(da, a);
+            double lunghezza = metri(strada);
             segmenti.add(new ApiSlowSegmentsDTO.Segment(
                     t.da(), da.name(), t.a(), a.name(),
                     t.linee().stream().sorted(PER_LINEA).toList(),
@@ -245,6 +232,34 @@ public class SlowSegmentsService {
         }
         risposte.put(chiave, new Risposta(aggregato, versioneGtfs, dto));
         return Optional.of(dto);
+    }
+
+    /**
+     * La strada fra due fermate che hanno le coordinate, come coppie [lon, lat]:
+     * il tracciato di una corsa che le serve, o la linea dritta se non si trova.
+     * Resta in memoria per la versione del GTFS in uso. La chiede anche
+     * CrowdingService, che disegna gli stessi tratti: una sola copia per tutti.
+     */
+    List<double[]> strada(GtfsIndexService.Stop da, GtfsIndexService.Stop a) {
+        Instant versioneGtfs = gtfs.dataVersion();
+        if (!versioneGtfs.equals(versioneGeometrie)) {
+            geometrie.clear();
+            versioneGeometrie = versioneGtfs;
+        }
+        return geometrie.computeIfAbsent(da.id() + "|" + a.id(), k -> {
+            List<double[]> s = gtfs.shapeBetweenStops(da.id(), a.id(), PunctualityService.oggi());
+            return s.isEmpty()
+                    ? List.of(new double[]{da.lon(), da.lat()}, new double[]{a.lon(), a.lat()})
+                    : s;
+        });
+    }
+
+    static double metri(List<double[]> strada) {
+        double lunghezza = 0;
+        for (int i = 1; i < strada.size(); i++) {
+            lunghezza += GtfsIndexService.metri(strada.get(i - 1), strada.get(i));
+        }
+        return lunghezza;
     }
 
     /**
@@ -307,7 +322,7 @@ public class SlowSegmentsService {
     }
 
     /** 8, 64, 492, H, n8: prima i numeri in ordine numerico, poi il resto. */
-    private static final Comparator<String> PER_LINEA = Comparator
+    static final Comparator<String> PER_LINEA = Comparator
             .comparing((String l) -> !l.matches("\\d+.*"))
             .thenComparingInt(l -> {
                 String cifre = l.replaceAll("^(\\d*).*", "$1");

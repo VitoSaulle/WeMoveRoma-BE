@@ -1,10 +1,12 @@
 package it.roma.gtfs.gtfs_monitor.controller;
 
 import it.roma.gtfs.gtfs_monitor.config.ResourceNotFoundException;
+import it.roma.gtfs.gtfs_monitor.model.dto.ApiCrowdingSegmentsDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiLinePatternDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiLinePunctualityDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiSlowSegmentsDTO;
 import it.roma.gtfs.gtfs_monitor.model.dto.ApiStopSchedulesDTO;
+import it.roma.gtfs.gtfs_monitor.service.CrowdingService;
 import it.roma.gtfs.gtfs_monitor.service.GtfsIndexService;
 import it.roma.gtfs.gtfs_monitor.service.PunctualityService;
 import it.roma.gtfs.gtfs_monitor.service.ServiceDayType;
@@ -35,6 +37,7 @@ public class ApiCatalogController {
     private final GtfsIndexService gtfsIndexService;
     private final PunctualityService punctualityService;
     private final SlowSegmentsService slowSegmentsService;
+    private final CrowdingService crowdingService;
 
     @GetMapping("/lines")
     public List<String> lines() {
@@ -216,6 +219,46 @@ public class ApiCatalogController {
         return slowSegmentsService.tratti(dayType, band, dal, al, linea)
                 .orElseThrow(() -> new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
                         "Storico dei tratti non disponibile"));
+    }
+
+    /**
+     * Quanto sono pieni i bus: per ogni tratto fra due fermate, ora per ora, in
+     * quanti passaggi il mezzo dichiarava soli posti in piedi, con la strada da
+     * disegnare. Vedi CrowdingService, e ApiCrowdingSegmentsDTO per come
+     * mostrarli.
+     *
+     * dayType: feriale (predefinito), sabato, festivo. line: solo i passaggi di
+     * quella linea (404 se non esiste). months: quanti mesi sommare, da quello in
+     * corso all'indietro (predefinito 2, cosi' i primi giorni del mese non
+     * restano senza dati). Senza dati per quel tipo di giorno risponde con gli
+     * elenchi vuoti e days = 0.
+     *
+     * 400 per parametri non validi, 503 se lo storico non e' raggiungibile.
+     */
+    @GetMapping("/crowding-segments")
+    public ApiCrowdingSegmentsDTO crowdingSegments(
+            @RequestParam(defaultValue = ServiceDayType.FERIALE) String dayType,
+            @RequestParam(required = false) String line,
+            @RequestParam(required = false) Integer months) {
+        if (!gtfsIndexService.isStaticDataLoaded()) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "Dati GTFS non ancora caricati, riprovare tra qualche istante");
+        }
+        if (!ServiceDayType.TUTTI.contains(dayType)) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "dayType: " + ServiceDayType.TUTTI);
+        }
+        int mesi = months != null ? months : CrowdingService.MESI_PREDEFINITI;
+        if (mesi < 1 || mesi > CrowdingService.MESI_MASSIMI) {
+            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+                    "months: da 1 a " + CrowdingService.MESI_MASSIMI);
+        }
+        String linea = line == null || line.isBlank() ? null : line.trim();
+        if (linea != null && gtfsIndexService.routeIdsByPublicLine(linea).isEmpty()) {
+            throw new ResourceNotFoundException("Linea", linea);
+        }
+        return crowdingService.tratti(dayType, mesi, linea)
+                .orElseThrow(() -> new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                        "Storico dell'affollamento non disponibile"));
     }
 
     @GetMapping("/destinations")

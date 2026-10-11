@@ -14,6 +14,7 @@ import org.springframework.dao.DataAccessException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.TransactionException;
 
 import javax.sql.DataSource;
 import java.sql.Date;
@@ -61,7 +62,8 @@ import java.util.regex.Pattern;
  *
  * MANUTENZIONE, ogni ora: partizioni del mese in corso e del successivo,
  * aggregato dei due giorni precedenti in puntualita_giornaliera e in
- * tratti_giornalieri (idempotenti, vedi SlowSegmentsService), eliminazione di
+ * tratti_giornalieri (idempotenti, vedi SlowSegmentsService), somma
+ * dell'affollamento dei giorni finiti (CrowdingService), eliminazione di
  * passaggi e corse oltre i 90 giorni.
  */
 @Slf4j
@@ -97,6 +99,7 @@ public class PunctualityService {
     private final JdbcTemplate jdbc;
     private final DataSource dataSource;
     private final SlowSegmentsService slowSegments;
+    private final CrowdingService crowding;
 
     @Value("${punctuality.enabled:true}")
     private boolean enabled;
@@ -440,6 +443,7 @@ public class PunctualityService {
                     FORTE_RITARDO_DA_SEC, Date.valueOf(ieri.minusDays(1)), Date.valueOf(ieri));
             log.info("[Puntualita] aggregati {} e {}: {} righe", ieri.minusDays(1), ieri, righe);
             aggregaTratti(ieri);
+            aggregaAffollamento(ieri);
             ultimoGiornoAggregato = ieri;
         }
 
@@ -493,6 +497,32 @@ public class PunctualityService {
                     System.currentTimeMillis() - inizio, eliminate);
         } catch (DataAccessException e) {
             avvisa("aggregato dei tratti fallito", e);
+        }
+    }
+
+    /**
+     * L'affollamento dei giorni finiti e non ancora sommati, fino all'altro ieri:
+     * le corse notturne di ieri finiscono oggi, e un giorno si somma una volta
+     * sola (CrowdingService). Come per i tratti, un errore non ferma il resto
+     * della manutenzione e si riprova domani.
+     */
+    private void aggregaAffollamento(LocalDate ieri) {
+        try {
+            long inizio = System.currentTimeMillis();
+            List<LocalDate> giorni = crowding.giorniMancanti(ieri.minusDays(1));
+            int righe = 0;
+            for (LocalDate giorno : giorni) {
+                righe += crowding.aggregaGiorno(giorno);
+            }
+            int eliminate = crowding.eliminaVecchi(oggi());
+            if (!giorni.isEmpty() || eliminate > 0) {
+                log.info("[Puntualita] affollamento di {} giorni ({} .. {}): {} righe in {} ms, {} eliminate",
+                        giorni.size(), giorni.isEmpty() ? "-" : giorni.getFirst(),
+                        giorni.isEmpty() ? "-" : giorni.getLast(), righe,
+                        System.currentTimeMillis() - inizio, eliminate);
+            }
+        } catch (DataAccessException | TransactionException e) {
+            avvisa("aggregato dell'affollamento fallito", e);
         }
     }
 
