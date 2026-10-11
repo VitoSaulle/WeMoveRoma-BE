@@ -60,6 +60,19 @@ public class ServiceAlertsService {
     @Value("${notifications.alerts.min-routes-for-push:5}")
     private int minRoutesForPush;
 
+    /**
+     * Se il primo giro dopo l'avvio spedisce le push (true) o si limita a
+     * marcare nel tracker gli avvisi gia' presenti (false, default). Come
+     * {@code strikes.dispatch-on-startup}: un redeploy che ha perso il file di
+     * stato non deve rispedire a tutti gli avvisi gia' in corso.
+     */
+    @Value("${notifications.alerts.dispatch-on-startup:false}")
+    private boolean dispatchOnStartup;
+
+    /** Diventa true al primo snapshot gestito dal poll schedulato. */
+    private final java.util.concurrent.atomic.AtomicBoolean primoGiroFatto =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
+
     /** Numero massimo di push per refresh: backstop anti-flood. */
     @Value("${notifications.alerts.max-per-refresh:5}")
     private int maxAlertsPerRefresh;
@@ -182,7 +195,11 @@ public class ServiceAlertsService {
         // a FCM le pagava quella richiesta, con le altre in fila dietro il lock.
         refreshCache(true).ifPresent(fresh -> {
             try {
-                dispatchNewAlertsToFcm(fresh);
+                if (primoGiroFatto.compareAndSet(false, true) && !dispatchOnStartup) {
+                    markCurrentAlertsWithoutPush(fresh);
+                } else {
+                    dispatchNewAlertsToFcm(fresh);
+                }
             } catch (Exception e) {
                 log.warn("[ServiceAlerts] dispatch push fallito: {}", e.toString());
             }
@@ -237,6 +254,31 @@ public class ServiceAlertsService {
     }
 
     /**
+     * Primo giro dopo l'avvio: marca come gia' notificati gli avvisi che
+     * passerebbero il filtro, senza spedire. Quelli che compaiono dopo
+     * partono normalmente.
+     */
+    private void markCurrentAlertsWithoutPush(List<ServiceAlertDTO> fresh) {
+        Set<String> wanted = parseSeverities(alertSeveritiesCsv);
+        List<String> keys = new ArrayList<>();
+        for (ServiceAlertDTO dto : fresh) {
+            if (dto.getId() == null || dto.getId().isBlank()) continue;
+            if (!daNotificare(dto, wanted, minRoutesForPush)) continue;
+            keys.add(dispatchKey(dto));
+        }
+        dispatchTracker.markAllSent(keys);
+        log.info("[ServiceAlerts] primo giro dopo l'avvio: {} avvisi marcati senza push.", keys.size());
+    }
+
+    /**
+     * Key dispatch: id+inizio_epoch — un alert con stesso id ma diverso
+     * active period e' un evento ri-comunicabile.
+     */
+    private static String dispatchKey(ServiceAlertDTO dto) {
+        return dto.getId() + "@" + (dto.getInizio() == null ? "" : dto.getInizio().getEpochSecond());
+    }
+
+    /**
      * Per ogni alert nello snapshot fresco: se filtra (severity) e non e' mai
      * stato notificato (AlertsDispatchTracker), invia una push al topic FCM.
      * Backstop {@code maxAlertsPerRefresh}: se ci sono N alert nuovi in un colpo
@@ -266,9 +308,7 @@ public class ServiceAlertsService {
             if (!daNotificare(dto, wanted, minRoutesForPush)) {
                 continue;
             }
-            // Key dispatch: id+inizio_epoch — un alert con stesso id ma diverso
-            // active period e' un evento ri-comunicabile.
-            String dispatchKey = id + "@" + (dto.getInizio() == null ? "" : dto.getInizio().getEpochSecond());
+            String dispatchKey = dispatchKey(dto);
             if (dispatchTracker.isSent(dispatchKey)) {
                 continue;
             }

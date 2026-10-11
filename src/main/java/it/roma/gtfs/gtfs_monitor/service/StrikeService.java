@@ -23,6 +23,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -71,6 +72,9 @@ public class StrikeService {
 
     private final AtomicReference<List<StrikeDTO>> lastSnapshot = new AtomicReference<>(List.of());
 
+    /** Diventa true al primo refresh riuscito che puo' spedire: quello che "scalda" il tracker. */
+    private final AtomicBoolean primoGiroFatto = new AtomicBoolean(false);
+
     /** Espone snapshot a controller / REST endpoint. */
     public List<StrikeDTO> snapshot() {
         return lastSnapshot.get();
@@ -81,11 +85,18 @@ public class StrikeService {
         return doRefresh(true);
     }
 
-    /** Primo refresh poco dopo il boot: popola il tracker senza dispatchare (anti-spam). */
+    /**
+     * Primo refresh poco dopo il boot: con {@code strikes.dispatch-on-startup=false}
+     * (default) marca nel tracker gli scioperi presenti senza spedire (anti-spam).
+     *
+     * <p>Prima il commento lo prometteva ma il codice non lo faceva: doRefresh(false)
+     * non marcava niente, e con lo stato perso (redeploy senza volume) il cron
+     * delle 6 o delle 14 rispediva tutti gli scioperi del registro.
+     */
     @Scheduled(initialDelay = 60_000, fixedDelay = Long.MAX_VALUE)
     public void warmup() {
         log.info("[Strikes] warmup refresh (dispatch={})", dispatchOnStartup);
-        doRefresh(dispatchOnStartup);
+        doRefresh(true);
     }
 
     /**
@@ -114,7 +125,15 @@ public class StrikeService {
             log.info("[Strikes] feed {} item totali, {} rilevanti per WeMoveRoma", parsed.size(), filtered.size());
 
             if (dispatch) {
-                dispatchNew(filtered);
+                if (primoGiroFatto.compareAndSet(false, true) && !dispatchOnStartup) {
+                    // Se il warmup fallisce, a scaldare il tracker e' il primo refresh
+                    // riuscito dopo: lo stesso anti-spam, solo piu' tardi.
+                    List<String> ids = filtered.stream().map(StrikeDTO::getId).toList();
+                    dispatchTracker.markAllSent(ids);
+                    log.info("[Strikes] primo giro dopo l'avvio: {} scioperi marcati senza push.", ids.size());
+                } else {
+                    dispatchNew(filtered);
+                }
             }
             return filtered;
         } catch (Exception e) {

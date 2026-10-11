@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -49,6 +50,23 @@ class StrikeDispatchTest {
         ReflectionTestUtils.setField(svc, "rssUrl", "http://feed/rss");
         ReflectionTestUtils.setField(svc, "sectorsCsv", "Trasporto Pubblico Locale");
         ReflectionTestUtils.setField(svc, "regionsCsv", "Italia,Lazio");
+        ReflectionTestUtils.setField(svc, "dispatchOnStartup", true);
+    }
+
+    @Test
+    @DisplayName("warmup con dispatch-on-startup=false: marca gli scioperi presenti senza spedire")
+    void warmupSoloMarca() {
+        ReflectionTestUtils.setField(svc, "dispatchOnStartup", false);
+
+        svc.warmup();
+
+        verify(fcm, never()).sendToTopic(anyString(), anyString(), anyString(), anyMap());
+        verify(tracker).markAllSent(List.of("123"));
+
+        // Il cron dopo spedisce di nuovo normalmente.
+        when(fcm.sendToTopic(anyString(), anyString(), anyString(), any())).thenReturn(true);
+        svc.scheduledRefresh();
+        verify(fcm, times(1)).sendToTopic(anyString(), anyString(), anyString(), anyMap());
     }
 
     @Test

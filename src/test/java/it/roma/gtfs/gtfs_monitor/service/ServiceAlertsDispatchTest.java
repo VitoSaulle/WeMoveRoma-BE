@@ -6,6 +6,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -46,6 +47,8 @@ class ServiceAlertsDispatchTest {
         ReflectionTestUtils.setField(svc, "alertSeveritiesCsv", "SEVERE");
         ReflectionTestUtils.setField(svc, "minRoutesForPush", 5);
         ReflectionTestUtils.setField(svc, "maxAlertsPerRefresh", 5);
+        // I test sull'invio partono gia' "scaldati": il primo giro spedisce.
+        ReflectionTestUtils.setField(svc, "dispatchOnStartup", true);
     }
 
     @Test
@@ -111,6 +114,24 @@ class ServiceAlertsDispatchTest {
         }
 
         verify(tracker, times(1)).markSent("A1@");
+    }
+
+    @Test
+    @DisplayName("primo giro dopo l'avvio: marca gli avvisi presenti senza spedire, poi i nuovi partono")
+    void primoGiroSoloMarca() {
+        ReflectionTestUtils.setField(svc, "dispatchOnStartup", false);
+        stub.serve(FeedStub.feed().addEntity(sospensione("A1")).build());
+        when(fcm.sendToTopic(anyString(), anyString(), anyString(), any())).thenReturn(true);
+
+        svc.scheduledRefresh();
+        verify(fcm, never()).sendToTopic(anyString(), anyString(), anyString(), anyMap());
+        verify(tracker).markAllSent(List.of("A1@"));
+
+        when(tracker.isSent("A1@")).thenReturn(true);
+        stub.serve(FeedStub.feed().addEntity(sospensione("A1")).addEntity(sospensione("A2")).build());
+        svc.scheduledRefresh();
+        verify(fcm, times(1)).sendToTopic(anyString(), anyString(), anyString(), anyMap());
+        verify(tracker).markSent("A2@");
     }
 
     @Test
