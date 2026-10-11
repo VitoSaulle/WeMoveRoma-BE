@@ -4,22 +4,42 @@ services:
     container_name: gtfs-monitor
     restart: unless-stopped
 
+    # I percorsi relativi (data-dir, state file) si risolvono rispetto alla cartella
+    # di lavoro: senza, nell'immagine sarebbe "/" e i dati finirebbero fuori dai volumi.
+    working_dir: /app
+
+    # Solo su loopback: da fuori si passa da nginx. Pubblicata su tutte le interfacce
+    # la porta scavalcava nginx (TLS, header, limiti) per chiunque raggiungesse l'host.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
 
     volumes:
       - ./app.jar:/app/app.jar:ro
       - ./data/gtfs_static:/app/data/gtfs_static
+      # Alert e scioperi gia' notificati: senza volume stavano in /root/.wemoveroma,
+      # persi a ogni ricreazione del container, e al riavvio ripartivano le push.
+      - ./data/notifications:/app/data/notifications
       - ./logs:/app/logs
 
     environment:
-      SPRING_PROFILES_ACTIVE: "local"
+      # prod: CORS solo wemoveroma.com e log dei controller a INFO. Con local i log
+      # DEBUG dei controller scrivevano in /app/logs le coordinate degli utenti
+      # (/nearby). Per lo sviluppo: SPRING_PROFILES_ACTIVE=local nel file .env.
+      SPRING_PROFILES_ACTIVE: "${SPRING_PROFILES_ACTIVE:-prod}"
 
       LOGGING_FILE_NAME: "/app/logs/app.log"
 
-      GTFS_STATIC_URL: "https://dati.comune.roma.it/catalog/dataset/a7dadb4a-66ae-4eff-8ded-a102064702ba/resource/266d82e1-ba53-4510-8a81-370880c4678f/download/rome_static_gtfs.zip"
-      GTFS_STATIC_DATADIR: "/app/data/gtfs_static"
-      GTFS_STATIC_REFRESHMILLIS: "3600000"
+      # Le chiavi sono gtfs.static-props.*: con il binding rilassato di Spring la
+      # variabile e' GTFS_STATICPROPS_<CHIAVE SENZA TRATTINI>. Le vecchie
+      # GTFS_STATIC_* puntavano a gtfs.static.* e venivano ignorate.
+      # L'URL resta quello di application.properties (Roma Mobilita'), che e' quello
+      # effettivamente usato finora: la vecchia GTFS_STATIC_URL non veniva letta.
+      GTFS_STATICPROPS_DATADIR: "/app/data/gtfs_static"
+      GTFS_STATICPROPS_REFRESHMILLIS: "3600000"
+
+      # Stato anti-duplicato delle push, sul volume ./data/notifications.
+      NOTIFICATIONS_STATEFILE: "/app/data/notifications/alerts-last-seen.json"
+      NOTIFICATIONS_STRIKES_STATEFILE: "/app/data/notifications/strikes-last-seen.json"
 
       # Storico su Postgres. La password sta nel file .env accanto a questo file.
       DB_URL: "jdbc:postgresql://postgres:5432/wemoveroma"
@@ -33,8 +53,10 @@ services:
 
       JAVA_OPTS: "-Xms512m -Xmx1g"
 
+    # $$ e non $: con un $ solo compose sostituiva JAVA_OPTS con la variabile della
+    # shell che lancia compose (di solito vuota) e le opzioni di heap non arrivavano.
     entrypoint: >
-      sh -c "java $JAVA_OPTS -jar /app/app.jar --server.port=8080"
+      sh -c "java $$JAVA_OPTS -jar /app/app.jar --server.port=8080"
       
 
   # Storico del servizio osservato (passaggi alle fermate, corse). Nessuna porta
