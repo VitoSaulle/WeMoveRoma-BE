@@ -44,6 +44,14 @@ public class StaticDataCacheConfig {
         return path != null && CACHEABLE.stream().anyMatch(p -> p.matcher(path).matches());
     }
 
+    /** Cache pubblica solo per i 2xx ancora modificabili; il resto tiene no-store. */
+    static void applyCacheControl(HttpServletResponse response) {
+        int status = response.getStatus();
+        if (!response.isCommitted() && status >= 200 && status < 300) {
+            response.setHeader(HttpHeaders.CACHE_CONTROL, "public, max-age=" + MAX_AGE_SECONDS);
+        }
+    }
+
     @Bean
     public ShallowEtagHeaderFilter staticDataEtagFilter() {
         return new ShallowEtagHeaderFilter() {
@@ -58,8 +66,20 @@ public class StaticDataCacheConfig {
                                             FilterChain filterChain) throws ServletException, IOException {
                 // Senza Cache-Control il browser rivalida comunque a ogni richiesta:
                 // l'ETag risparmia banda, questo risparmia anche il giro di rete.
-                response.setHeader(HttpHeaders.CACHE_CONTROL, "public, max-age=" + MAX_AGE_SECONDS);
-                super.doFilterInternal(request, response, filterChain);
+                //
+                // Ma solo sulle risposte 2xx: prima l'header partiva prima di sapere
+                // lo stato, e un 503 all'avvio (dati GTFS non ancora caricati), un 404
+                // o un 400 restavano in cache pubblica per 5 minuti. Si parte quindi da
+                // no-store, che resta se la risposta e' un errore o e' gia' stata
+                // inviata (sendError), e si passa a public solo a catena finita su un
+                // 2xx: il corpo e' ancora nel buffer del filtro ETag, gli header si
+                // possono cambiare.
+                response.setHeader(HttpHeaders.CACHE_CONTROL, "no-store");
+                FilterChain conCache = (req, res) -> {
+                    filterChain.doFilter(req, res);
+                    applyCacheControl((HttpServletResponse) res);
+                };
+                super.doFilterInternal(request, response, conCache);
             }
         };
     }

@@ -33,6 +33,9 @@ public class ApiStopsController {
             @RequestParam(required = false) Double maxLon,
             @RequestParam(required = false) Integer limit
     ) {
+        // Senza il controllo, all'avvio rispondeva 200 con lista vuota e
+        // generatedAt=EPOCH, e quella risposta finiva in cache per 5 minuti.
+        requireStaticData();
         List<ApiStopSearchItemDTO> items = nearbyService.listStops(minLat, maxLat, minLon, maxLon, limit);
         // Versione dei dati, non istante della richiesta: con Instant.now() la
         // risposta cambiava a ogni chiamata e l'ETag non produceva mai un 304.
@@ -44,6 +47,7 @@ public class ApiStopsController {
             @RequestParam String q,
             @RequestParam(required = false) Integer limit
     ) {
+        requireStaticData();
         List<ApiStopSearchItemDTO> items = nearbyService.searchStops(q, limit);
         return new ApiListResponseDTO<>(items, items.size(), indexService.dataVersion());
     }
