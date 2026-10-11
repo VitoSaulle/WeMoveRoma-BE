@@ -23,6 +23,16 @@ class ServiceDayTypeTest {
         assertEquals("festivo", ServiceDayType.di(LocalDate.of(2026, 9, 20)));   // domenica
     }
 
+    /** San Francesco d'Assisi, festa nazionale dalla legge 151/2025: dal 2026, non prima. */
+    @Test
+    void sanFrancescoDal2026() {
+        assertEquals("festivo", ServiceDayType.di(LocalDate.of(2027, 10, 4)));   // lunedi'
+        assertEquals("festivo", ServiceDayType.di(LocalDate.of(2028, 10, 4)));   // mercoledi'
+        assertEquals("feriale", ServiceDayType.di(LocalDate.of(2027, 10, 5)));   // martedi'
+        assertEquals("feriale", ServiceDayType.di(LocalDate.of(2024, 10, 4)));   // venerdi', prima della legge
+        assertEquals("sabato", ServiceDayType.di(LocalDate.of(2025, 10, 4)));    // sabato, prima della legge
+    }
+
     /** I giorni della settimana che la classificazione dal GTFS aveva sbagliato. */
     @Test
     void settimanaNormale() {
