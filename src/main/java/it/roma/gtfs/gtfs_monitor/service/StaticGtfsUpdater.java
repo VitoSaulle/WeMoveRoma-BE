@@ -113,14 +113,18 @@ public class StaticGtfsUpdater {
         return valore.isEmpty() ? null : valore;
     }
 
+    /**
+     * Costruzione dal disco e refresh d'avvio girano sullo stesso executor dei
+     * refresh programmati, uno dopo l'altro. Prima avevano un thread a parte: un
+     * cron o un retry che partiva nel frattempo poteva estrarre il feed nuovo e
+     * spostare la cartella mentre rebuildIndexes la stava leggendo.
+     */
     @EventListener(ApplicationReadyEvent.class)
     public void onApplicationReady() {
-        Thread t = new Thread(() -> {
+        refreshExecutor.execute(() -> {
             costruisciIndiciDaDisco();
             runRefresh("startup");
-        }, "static-gtfs-startup-refresh");
-        t.setDaemon(true);
-        t.start();
+        });
     }
 
     /**
@@ -138,16 +142,24 @@ public class StaticGtfsUpdater {
      * aggiornare quel disco, non a popolare la memoria.
      */
     private void costruisciIndiciDaDisco() {
-        Path stopTimes = Path.of(props.staticProps().dataDir()).resolve("stop_times.txt");
-        if (!Files.isRegularFile(stopTimes)) {
-            log.info("[StaticGTFS] Nessun feed sul disco: gli indici arriveranno col primo download.");
+        // Stessa bandiera del refresh: mentre si leggono i file dal disco nessun
+        // refresh deve poterli sostituire.
+        if (!refreshInProgress.compareAndSet(false, true)) {
+            log.warn("[StaticGTFS] Refresh gia' in corso: indici dal disco non costruiti, li costruira' il refresh");
             return;
         }
         try {
+            Path stopTimes = Path.of(props.staticProps().dataDir()).resolve("stop_times.txt");
+            if (!Files.isRegularFile(stopTimes)) {
+                log.info("[StaticGTFS] Nessun feed sul disco: gli indici arriveranno col primo download.");
+                return;
+            }
             indexService.rebuildIndexes();
             log.info("[StaticGTFS] Indici costruiti dal feed gia' presente sul disco");
         } catch (Exception e) {
             log.error("[StaticGTFS] Costruzione indici dal disco fallita: {}", e.toString());
+        } finally {
+            refreshInProgress.set(false);
         }
     }
 
@@ -241,7 +253,8 @@ public class StaticGtfsUpdater {
         }
     }
 
-    private Mono<Void> handleZipResponse(ResponseEntity<byte[]> resp) {
+    // package-private per i test
+    Mono<Void> handleZipResponse(ResponseEntity<byte[]> resp) {
 
         HttpStatusCode status = resp.getStatusCode();
         log.info("[StaticGTFS] handleZipResponse avviato. HTTP={}", status.value());
@@ -260,13 +273,18 @@ public class StaticGtfsUpdater {
             return Mono.empty();
         }
 
-        this.etag = resp.getHeaders().getFirst(HttpHeaders.ETAG);
-        this.lastModified = resp.getHeaders().getFirst(HttpHeaders.LAST_MODIFIED);
+        // Header del nuovo feed tenuti da parte: diventano lo stato del client solo
+        // a rebuild riuscito. Assegnati subito, un'estrazione o un rebuild falliti
+        // lasciavano ETag e Last-Modified del feed scartato, il retry riceveva 304
+        // e si fermava, e restavamo sui dati vecchi fino al cambio di feed successivo.
+        String newEtag = resp.getHeaders().getFirst(HttpHeaders.ETAG);
+        String newLastModified = resp.getHeaders().getFirst(HttpHeaders.LAST_MODIFIED);
 
-        log.info("[StaticGTFS] Nuovi header: ETag={} Last-Modified={}", etag, lastModified);
+        log.info("[StaticGTFS] Nuovi header: ETag={} Last-Modified={}", newEtag, newLastModified);
 
+        Path tmp = null;
         try {
-            Path tmp = Files.createTempFile("gtfs_static_", ".zip");
+            tmp = Files.createTempFile("gtfs_static_", ".zip");
             log.info("[StaticGTFS] Creato file temporaneo: {}", tmp);
 
             Files.write(tmp, resp.getBody());
@@ -283,18 +301,17 @@ public class StaticGtfsUpdater {
                 indexService.rebuildIndexes();
                 log.info("[StaticGTFS] Indici ricostruiti correttamente");
 
-                finalizeAtomicSwap(swap);
+                finalizeAtomicSwap(swap, newEtag, newLastModified);
 
                 // QUI consideriamo il refresh riuscito → stop retry
+                this.etag = newEtag;
+                this.lastModified = newLastModified;
                 refreshFailed = false;
             } catch (Throwable t) {
                 log.error("[StaticGTFS] Ricostruzione indici fallita, ripristino backup: {}", t.toString());
                 refreshFailed = true;
                 restoreAtomicSwap(swap);
                 throw t;
-            } finally {
-                Files.deleteIfExists(tmp);
-                log.info("[StaticGTFS] File temporaneo eliminato");
             }
 
         } catch (Throwable e) {
@@ -302,6 +319,17 @@ public class StaticGtfsUpdater {
             refreshFailed = true;
             if (e instanceof Error err) {
                 throw err;
+            }
+        } finally {
+            // Qui e non intorno al solo rebuild: se falliva la scrittura o
+            // l'estrazione lo zip da decine di MB restava nella cartella temporanea.
+            if (tmp != null) {
+                try {
+                    Files.deleteIfExists(tmp);
+                    log.info("[StaticGTFS] File temporaneo eliminato");
+                } catch (IOException e) {
+                    log.warn("[StaticGTFS] File temporaneo {} non eliminato: {}", tmp, e.toString());
+                }
             }
         }
 
@@ -366,14 +394,14 @@ public class StaticGtfsUpdater {
         return new AtomicSwapContext(targetDir, backup, Files.exists(backup));
     }
 
-    private void finalizeAtomicSwap(AtomicSwapContext swap) throws IOException {
+    private void finalizeAtomicSwap(AtomicSwapContext swap, String newEtag, String newLastModified) throws IOException {
         if (Files.exists(swap.backupDir())) {
             log.info("[StaticGTFS] Rimozione backup");
             deleteRecursively(swap.backupDir());
         }
 
         log.info("[StaticGTFS] Salvataggio stato JSON");
-        saveStateJson();
+        saveStateJson(newEtag, newLastModified);
     }
 
     private void restoreAtomicSwap(AtomicSwapContext swap) {
@@ -394,14 +422,16 @@ public class StaticGtfsUpdater {
 
     private void deleteRecursively(Path p) throws IOException {
         if (!Files.exists(p)) return;
-        Files.walk(p)
-                .sorted((a, b) -> b.compareTo(a))
-                .forEach(path -> {
-                    try { Files.deleteIfExists(path); } catch (IOException ignored) {}
-                });
+        // Lo stream di Files.walk tiene aperti i descrittori delle cartelle: va chiuso.
+        try (java.util.stream.Stream<Path> walk = Files.walk(p)) {
+            walk.sorted((a, b) -> b.compareTo(a))
+                    .forEach(path -> {
+                        try { Files.deleteIfExists(path); } catch (IOException ignored) {}
+                    });
+        }
     }
 
-    private void saveStateJson() {
+    private void saveStateJson(String etag, String lastModified) {
         try {
             Path dataDir = Path.of(props.staticProps().dataDir());
             Path stateFile = dataDir.resolve(".gtfs_static_state.json");
